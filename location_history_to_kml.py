@@ -11,7 +11,7 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -19,8 +19,8 @@ from typing import Any, Iterable
 KML_NAMESPACE = "http://www.opengis.net/kml/2.2"
 MAX_SNAP_OFFSET_DEGREES = 1.5e-4
 ACTIVITY_TYPES = {
-    "car": {"IN_ROAD_VEHICLE", "IN_VEHICLE"},
-    "bike": {"ON_BICYCLE"},
+    "car": {"IN_ROAD_VEHICLE", "IN_VEHICLE", "IN_PASSENGER_VEHICLE"},
+    "bike": {"ON_BICYCLE", "CYCLING"},
 }
 ET.register_namespace("", KML_NAMESPACE)
 
@@ -48,6 +48,17 @@ def parse_timestamp(value: Any, milliseconds: bool = False) -> datetime | None:
         return timestamp.astimezone(timezone.utc)
     except (OverflowError, OSError, TypeError, ValueError):
         return None
+
+
+def parse_timestamp_date(value: Any) -> date | None:
+    if isinstance(value, str):
+        try:
+            normalized = value.strip().replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).date()
+        except ValueError:
+            pass
+    timestamp = parse_timestamp(value)
+    return timestamp.date() if timestamp is not None else None
 
 
 def parse_coordinates(value: Any) -> tuple[float, float] | None:
@@ -98,18 +109,97 @@ def input_json_files(inputs: Iterable[Path]) -> list[Path]:
     return sorted(set(files))
 
 
-def activity_runs_from_data(data: Any, mode: str) -> list[list[TrackPoint]]:
-    if not isinstance(data, dict) or not isinstance(data.get("rawSignals"), list):
+def parse_date_filter(raw_value: str | None) -> tuple[str, str] | None:
+    if raw_value is None:
+        return None
+
+    value = raw_value.strip()
+    if not value:
+        raise ValueError("Date filter cannot be empty")
+
+    try:
+        if ":" in value:
+            start_text, end_text = value.split(":", 1)
+            start = date.fromisoformat(start_text)
+            end = date.fromisoformat(end_text)
+            if end < start:
+                raise ValueError("Date range start must be earlier than or equal to the end date")
+        else:
+            start = date.fromisoformat(value)
+            end = start
+    except ValueError as error:
+        raise ValueError(
+            "Date filter must be YYYY-MM-DD or YYYY-MM-DD:YYYY-MM-DD"
+        ) from error
+
+    return start.isoformat(), end.isoformat()
+
+
+def semantic_activity_runs_from_data(
+    data: Any, mode: str, date_filter: tuple[str, str] | None = None
+) -> list[list[TrackPoint]]:
+    if not isinstance(data, dict) or not isinstance(data.get("semanticSegments"), list):
         return []
+
+    start_date = date.fromisoformat(date_filter[0]) if date_filter is not None else None
+    end_date = date.fromisoformat(date_filter[1]) if date_filter is not None else None
+    runs: list[list[TrackPoint]] = []
+    for segment in data["semanticSegments"]:
+        if not isinstance(segment, dict):
+            continue
+        activity = segment.get("activity")
+        candidate = activity.get("topCandidate") if isinstance(activity, dict) else None
+        if not isinstance(candidate, dict) or candidate.get("type") not in ACTIVITY_TYPES[mode]:
+            continue
+
+        points: list[TrackPoint] = []
+        for endpoint, timestamp_key in (("start", "startTime"), ("end", "endTime")):
+            raw_timestamp = segment.get(timestamp_key)
+            timestamp = parse_timestamp(raw_timestamp)
+            calendar_date = parse_timestamp_date(raw_timestamp)
+            if timestamp is None or calendar_date is None:
+                continue
+            if start_date is not None and end_date is not None:
+                if not (start_date <= calendar_date <= end_date):
+                    continue
+            location = activity.get(endpoint)
+            coordinates = parse_coordinates(location.get("latLng")) if isinstance(location, dict) else None
+            point = make_point(coordinates, timestamp)
+            if point is not None:
+                points.append(point)
+
+        if len(points) >= 2:
+            points.sort(key=lambda point: point.timestamp or datetime.min.replace(tzinfo=timezone.utc))
+            runs.append(points)
+    return runs
+
+
+def activity_runs_from_data(data: Any, mode: str, date_filter: tuple[str, str] | None = None) -> list[list[TrackPoint]]:
+    if not isinstance(data, dict):
+        return []
+    raw_signals = data.get("rawSignals", [])
+    if not isinstance(raw_signals, list):
+        raw_signals = []
+
+    start_date = None
+    end_date = None
+    if date_filter is not None:
+        start_date = date.fromisoformat(date_filter[0])
+        end_date = date.fromisoformat(date_filter[1])
 
     activities: list[tuple[datetime, bool]] = []
     positions: list[tuple[datetime, TrackPoint]] = []
-    for signal in data["rawSignals"]:
+    for signal in raw_signals:
         if not isinstance(signal, dict):
             continue
         activity = signal.get("activityRecord")
         if isinstance(activity, dict):
-            timestamp = parse_timestamp(activity.get("timestamp"))
+            raw_timestamp = activity.get("timestamp")
+            timestamp = parse_timestamp(raw_timestamp)
+            calendar_date = parse_timestamp_date(raw_timestamp)
+            if calendar_date is not None and start_date is not None and end_date is not None:
+                if not (start_date <= calendar_date <= end_date):
+                    continue
             probabilities = activity.get("probableActivities", [])
             if timestamp is not None and probabilities:
                 best = max(
@@ -121,7 +211,12 @@ def activity_runs_from_data(data: Any, mode: str) -> list[list[TrackPoint]]:
 
         position = signal.get("position")
         if isinstance(position, dict):
-            timestamp = parse_timestamp(position.get("timestamp"))
+            raw_timestamp = position.get("timestamp")
+            timestamp = parse_timestamp(raw_timestamp)
+            calendar_date = parse_timestamp_date(raw_timestamp)
+            if calendar_date is not None and start_date is not None and end_date is not None:
+                if not (start_date <= calendar_date <= end_date):
+                    continue
             point = make_point(parse_coordinates(position.get("LatLng")), timestamp)
             if timestamp is not None and point is not None:
                 positions.append((timestamp, point))
@@ -145,7 +240,8 @@ def activity_runs_from_data(data: Any, mode: str) -> list[list[TrackPoint]]:
             current_run = []
     if current_run:
         runs.append(current_run)
-    return [run for run in runs if len(run) >= 2]
+    raw_runs = [run for run in runs if len(run) >= 2]
+    return raw_runs if raw_runs else semantic_activity_runs_from_data(data, mode, date_filter)
 
 
 def project_point_to_segment(
@@ -229,6 +325,11 @@ def main() -> int:
     parser.add_argument("input", nargs="+", type=Path, help="JSON file(s) or folder(s) containing JSON")
     parser.add_argument("output", type=Path, help="Output KML file for Google My Maps")
     parser.add_argument("--name", default="Location History", help="Name for the map layer")
+    parser.add_argument(
+        "-d",
+        "--date",
+        help="Filter records to a single day (YYYY-MM-DD) or day range (YYYY-MM-DD:YYYY-MM-DD)",
+    )
     activity_group = parser.add_mutually_exclusive_group(required=True)
     activity_group.add_argument("-c", "--car", action="store_const", const="car", dest="mode", help="Select car/vehicle activity")
     activity_group.add_argument("-b", "--bike", action="store_const", const="bike", dest="mode", help="Select bicycle activity")
@@ -236,15 +337,17 @@ def main() -> int:
     arguments = parser.parse_args()
 
     try:
+        date_filter = parse_date_filter(arguments.date)
         files = input_json_files(arguments.input)
         if not files:
             parser.error("No JSON files found in the supplied input paths")
         runs: list[list[TrackPoint]] = []
         for path in files:
             with path.open(encoding="utf-8") as source:
-                runs.extend(activity_runs_from_data(json.load(source), arguments.mode))
+                runs.extend(activity_runs_from_data(json.load(source), arguments.mode, date_filter=date_filter))
         if not runs:
-            raise ValueError(f"No {arguments.mode} activity samples with usable GPS positions were found")
+            label = f"for {date_filter[0]} to {date_filter[1]}" if date_filter else ""
+            raise ValueError(f"No {arguments.mode} activity samples with usable GPS positions were found {label}".strip())
         if arguments.snap:
             routes = snap_runs(runs)
         else:
