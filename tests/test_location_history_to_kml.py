@@ -2,7 +2,6 @@ import json
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
-from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -58,41 +57,42 @@ class LocationHistoryRoutesTests(unittest.TestCase):
         self.assertEqual([[point.latitude for point in run] for run in car_runs], [[40.0, 40.1]])
         self.assertEqual([[point.latitude for point in run] for run in bike_runs], [[40.2, 40.3]])
 
-    def test_snap_chunk_sends_google_roads_request_and_reads_response(self):
-        response = BytesIO(
-            json.dumps(
-                {
-                    "snappedPoints": [
-                        {"location": {"latitude": 40.001, "longitude": -73.001}},
-                        {"location": {"latitude": 40.101, "longitude": -73.101}},
-                    ]
-                }
-            ).encode("utf-8")
+    def test_snap_chunk_only_corrects_small_local_jitter(self):
+        coordinates = snap_chunk(
+            [
+                TrackPoint(0.0, 0.0),
+                TrackPoint(5.0, 5.0),
+                TrackPoint(10.0, 0.0),
+            ]
         )
-        with patch("location_history_to_kml.urllib.request.urlopen", return_value=response) as urlopen:
-            coordinates = snap_chunk(
-                [
-                    TrackPoint(40.0, -73.0),
-                    TrackPoint(40.1, -73.1),
-                ],
-                "test-key",
-            )
 
-        request = urlopen.call_args.args[0]
-        from urllib.parse import parse_qs, urlsplit
+        self.assertEqual(len(coordinates), 3)
+        self.assertEqual(coordinates[1], (5.0, 5.0))
 
-        query = parse_qs(urlsplit(request.full_url).query)
-        self.assertEqual(query["key"], ["test-key"])
-        self.assertEqual(query["interpolate"], ["true"])
-        self.assertEqual(len(query["path"][0].split("|")), 2)
-        self.assertEqual(coordinates, [(40.001, -73.001), (40.101, -73.101)])
+    def test_snap_chunk_projects_points_onto_local_route(self):
+        coordinates = snap_chunk(
+            [
+                TrackPoint(40.0, -73.0),
+                TrackPoint(40.1, -73.1),
+                TrackPoint(40.2, -73.2),
+            ]
+        )
 
-    def test_snap_runs_chunks_at_google_limit_with_overlap(self):
+        self.assertEqual(len(coordinates), 3)
+        self.assertAlmostEqual(coordinates[0][0], 40.0)
+        self.assertAlmostEqual(coordinates[0][1], -73.0)
+        self.assertAlmostEqual(coordinates[1][0], 40.1)
+        self.assertAlmostEqual(coordinates[1][1], -73.1)
+        self.assertAlmostEqual(coordinates[2][0], 40.2)
+        self.assertAlmostEqual(coordinates[2][1], -73.2)
+
+    def test_snap_runs_uses_one_call_per_run(self):
         points = [TrackPoint(40.0 + index / 10_000, -73.0) for index in range(103)]
         with patch("location_history_to_kml.snap_chunk", side_effect=lambda chunk, key: [(p.latitude, p.longitude) for p in chunk]) as snap:
             snap_runs([points], "test-key")
 
-        self.assertEqual([len(call.args[0]) for call in snap.call_args_list], [100, 4])
+        self.assertEqual(len(snap.call_args_list), 1)
+        self.assertEqual(len(snap.call_args_list[0].args[0]), 103)
 
     def test_without_snap_writes_recorded_points_without_an_api_key(self):
         data = {

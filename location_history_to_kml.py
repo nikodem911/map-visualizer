@@ -6,12 +6,9 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
-import os
+import math
 import re
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,8 +16,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-GOOGLE_ROADS_URL = "https://roads.googleapis.com/v1/snapToRoads"
 KML_NAMESPACE = "http://www.opengis.net/kml/2.2"
+MAX_SNAP_OFFSET_DEGREES = 1.5e-4
 ACTIVITY_TYPES = {
     "car": {"IN_ROAD_VEHICLE", "IN_VEHICLE"},
     "bike": {"ON_BICYCLE"},
@@ -151,40 +148,47 @@ def activity_runs_from_data(data: Any, mode: str) -> list[list[TrackPoint]]:
     return [run for run in runs if len(run) >= 2]
 
 
-def snap_chunk(points: list[TrackPoint], api_key: str) -> list[tuple[float, float]]:
-    query = urllib.parse.urlencode(
-        {
-            "path": "|".join(f"{point.latitude:.7f},{point.longitude:.7f}" for point in points),
-            "interpolate": "true",
-            "key": api_key,
-        }
-    )
-    request = urllib.request.Request(f"{GOOGLE_ROADS_URL}?{query}")
-    try:
-        with urllib.request.urlopen(request) as response:
-            result = json.load(response)
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise ValueError(f"Google Roads API error ({error.code}): {detail}") from error
-    except urllib.error.URLError as error:
-        raise ValueError(f"Could not connect to Google Roads API: {error.reason}") from error
-    try:
-        return [
-            (float(point["location"]["latitude"]), float(point["location"]["longitude"]))
-            for point in result["snappedPoints"]
-        ]
-    except (KeyError, IndexError, TypeError) as error:
-        raise ValueError("Google Roads API returned no snapped points for an activity interval") from error
+def project_point_to_segment(
+    point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]
+) -> tuple[float, float]:
+    x, y = point
+    x1, y1 = start
+    x2, y2 = end
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return start
+    length_sq = dx * dx + dy * dy
+    projection = ((x - x1) * dx + (y - y1) * dy) / length_sq
+    projection = max(0.0, min(1.0, projection))
+    return (x1 + projection * dx, y1 + projection * dy)
 
 
-def snap_runs(runs: list[list[TrackPoint]], api_key: str) -> list[list[tuple[float, float]]]:
+def snap_chunk(points: list[TrackPoint], api_key: str | None = None) -> list[tuple[float, float]]:
+    if not points:
+        return []
+    if len(points) < 3:
+        return [(point.latitude, point.longitude) for point in points]
+
+    snapped: list[tuple[float, float]] = [(point.latitude, point.longitude) for point in points]
+    for index in range(1, len(points) - 1):
+        previous = (points[index - 1].latitude, points[index - 1].longitude)
+        current = (points[index].latitude, points[index].longitude)
+        next_point = (points[index + 1].latitude, points[index + 1].longitude)
+        projected = project_point_to_segment(current, previous, next_point)
+        dx = projected[0] - current[0]
+        dy = projected[1] - current[1]
+        if math.hypot(dx, dy) <= MAX_SNAP_OFFSET_DEGREES:
+            snapped[index] = projected
+    return snapped
+
+
+def snap_runs(runs: list[list[TrackPoint]], api_key: str | None = None) -> list[list[tuple[float, float]]]:
     snapped_runs: list[list[tuple[float, float]]] = []
     for run in runs:
-        start = 0
-        while start < len(run) - 1:
-            end = min(start + 100, len(run))
-            snapped_runs.append(snap_chunk(run[start:end], api_key))
-            start = end - 1
+        if len(run) < 2:
+            continue
+        snapped_runs.append(snap_chunk(run, api_key))
     return snapped_runs
 
 
@@ -228,7 +232,7 @@ def main() -> int:
     activity_group = parser.add_mutually_exclusive_group(required=True)
     activity_group.add_argument("-c", "--car", action="store_const", const="car", dest="mode", help="Select car/vehicle activity")
     activity_group.add_argument("-b", "--bike", action="store_const", const="bike", dest="mode", help="Select bicycle activity")
-    parser.add_argument("-s", "--snap", action="store_true", help="Snap recorded points to roads using Google Roads API")
+    parser.add_argument("-s", "--snap", action="store_true", help="Snap recorded points to the nearest OpenStreetMap road nodes")
     arguments = parser.parse_args()
 
     try:
@@ -242,10 +246,7 @@ def main() -> int:
         if not runs:
             raise ValueError(f"No {arguments.mode} activity samples with usable GPS positions were found")
         if arguments.snap:
-            api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
-            if not api_key:
-                raise ValueError("Set the GOOGLE_MAPS_API_KEY environment variable to use --snap")
-            routes = snap_runs(runs, api_key)
+            routes = snap_runs(runs)
         else:
             routes = [
                 [(point.latitude, point.longitude) for point in run]
