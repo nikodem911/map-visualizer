@@ -15,7 +15,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-The script uses the Python standard library for both filtering and snapping. To leave the virtual environment when finished, run `deactivate`.
+The script uses only the Python standard library. To leave the virtual environment when finished, run `deactivate`.
 
 ## Export for Google My Maps
 
@@ -41,9 +41,9 @@ To smooth only minor GPS jitter without needing any external API, run the export
 python3 location_history_to_kml.py .tmp/timeline_august_2026.json august-car-snapped.kml --car --snap --name "August 2026 driving"
 ```
 
-`--snap` is a conservative local smoothing pass: it only nudges a point if it is very close to the line between its neighbors, so the route stays faithful to the original track while removing small measurement noise.
+`--snap` is entirely local. It smooths only minor GPS jitter, and splits a route at time gaps or physically impossible jumps rather than drawing a line across them. It does not download map data or match points against a road network.
 
-The `--car` option selects vehicle activities; `--bike` selects bicycle activities. In `rawSignals` exports, timestamped activity records classify nearby GPS samples. In `semanticSegments` exports, matching activity segments contribute their start and end coordinates.
+The `--car` option selects vehicle activities; `--bike` selects bicycle activities. In `rawSignals` exports, timestamped activity records classify nearby GPS samples. In `semanticSegments` exports, matching activity segments include their start/end coordinates and any timestamped `timelinePath` samples during the trip.
 
 Import the resulting `.kml` file into a new map at [Google My Maps](https://www.google.com/mymaps): choose **Add layer** or **Import**, then select the KML file.
 

@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -130,6 +131,12 @@ class LocationHistoryRoutesTests(unittest.TestCase):
                         "end": {"latLng": "49.1°, 19.1°"},
                         "topCandidate": {"type": "IN_PASSENGER_VEHICLE"},
                     },
+                    "timelinePath": [
+                        {"time": "2025-07-31T23:59:00+02:00", "point": "48.9°, 18.9°"},
+                        {"time": "2025-08-01T00:01:00+02:00", "point": "49.03°, 19.03°"},
+                        {"time": "2025-08-01T00:03:00+02:00", "point": "49.07°, 19.07°"},
+                        {"time": "2025-08-01T00:06:00+02:00", "point": "49.2°, 19.2°"},
+                    ],
                 },
                 {
                     "startTime": "2025-08-02T08:00:00+02:00",
@@ -156,8 +163,33 @@ class LocationHistoryRoutesTests(unittest.TestCase):
 
         self.assertEqual(
             [[(point.latitude, point.longitude) for point in run] for run in runs],
-            [[(49.0, 19.0), (49.1, 19.1)]],
+            [[(49.0, 19.0), (49.03, 19.03), (49.07, 19.07), (49.1, 19.1)]],
         )
+
+    def test_semantic_route_drops_impossible_activity_endpoint(self):
+        data = {
+            "semanticSegments": [
+                {
+                    "startTime": "2025-08-01T10:00:00+02:00",
+                    "endTime": "2025-08-01T10:05:00+02:00",
+                    "activity": {
+                        "start": {"latLng": "47.24298°, 15.99675°"},
+                        "end": {"latLng": "46.65°, 14.52°"},
+                        "topCandidate": {"type": "IN_PASSENGER_VEHICLE"},
+                    },
+                    "timelinePath": [
+                        {"time": "2025-08-01T10:00:03+02:00", "point": "46.63903°, 14.44321°"},
+                        {"time": "2025-08-01T10:01:00+02:00", "point": "46.64034°, 14.47017°"},
+                        {"time": "2025-08-01T10:05:00+02:00", "point": "46.65°, 14.52°"},
+                    ],
+                }
+            ]
+        }
+
+        runs = activity_runs_from_data(data, "car")
+
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0][0].latitude, 46.63903)
 
     def test_snap_chunk_only_corrects_small_local_jitter(self):
         coordinates = snap_chunk(
@@ -190,11 +222,28 @@ class LocationHistoryRoutesTests(unittest.TestCase):
 
     def test_snap_runs_uses_one_call_per_run(self):
         points = [TrackPoint(40.0 + index / 10_000, -73.0) for index in range(103)]
-        with patch("location_history_to_kml.snap_chunk", side_effect=lambda chunk, key: [(p.latitude, p.longitude) for p in chunk]) as snap:
-            snap_runs([points], "test-key")
+        with patch("location_history_to_kml.snap_chunk", side_effect=lambda chunk: [(p.latitude, p.longitude) for p in chunk]) as snap:
+            snap_runs([points])
 
         self.assertEqual(len(snap.call_args_list), 1)
         self.assertEqual(len(snap.call_args_list[0].args[0]), 103)
+
+    def test_snap_runs_splits_impossible_jumps(self):
+        start = datetime(2025, 8, 1, tzinfo=timezone.utc)
+        points = [
+            TrackPoint(49.0, 19.0, start),
+            TrackPoint(49.001, 19.001, start + timedelta(minutes=1)),
+            TrackPoint(48.0, 17.0, start + timedelta(minutes=1, seconds=3)),
+            TrackPoint(48.001, 17.001, start + timedelta(minutes=2)),
+        ]
+
+        with patch("location_history_to_kml.snap_chunk", side_effect=lambda chunk: [(p.latitude, p.longitude) for p in chunk]) as snap:
+            routes = snap_runs([points])
+
+        self.assertEqual(len(routes), 2)
+        self.assertEqual(len(snap.call_args_list), 2)
+        self.assertEqual(routes[0], [(49.0, 19.0), (49.001, 19.001)])
+        self.assertEqual(routes[1], [(48.0, 17.0), (48.001, 17.001)])
 
     def test_without_snap_writes_recorded_points_without_an_api_key(self):
         data = {

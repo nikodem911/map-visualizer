@@ -18,6 +18,9 @@ from typing import Any, Iterable
 
 KML_NAMESPACE = "http://www.opengis.net/kml/2.2"
 MAX_SNAP_OFFSET_DEGREES = 1.5e-4
+MAX_ACTIVITY_ENDPOINT_SPEED_METERS_PER_SECOND = 70
+ACTIVITY_ENDPOINT_TOLERANCE_METERS = 1000
+MAX_TRACK_GAP_SECONDS = 900
 ACTIVITY_TYPES = {
     "car": {"IN_ROAD_VEHICLE", "IN_VEHICLE", "IN_PASSENGER_VEHICLE"},
     "bike": {"ON_BICYCLE", "CYCLING"},
@@ -97,6 +100,18 @@ def make_point(
     return TrackPoint(latitude, longitude, timestamp)
 
 
+def distance_meters(first: TrackPoint, second: TrackPoint) -> float:
+    latitude1 = math.radians(first.latitude)
+    latitude2 = math.radians(second.latitude)
+    latitude_delta = latitude2 - latitude1
+    longitude_delta = math.radians(second.longitude - first.longitude)
+    haversine = (
+        math.sin(latitude_delta / 2) ** 2
+        + math.cos(latitude1) * math.cos(latitude2) * math.sin(longitude_delta / 2) ** 2
+    )
+    return 12_742_000 * math.asin(math.sqrt(haversine))
+
+
 def input_json_files(inputs: Iterable[Path]) -> list[Path]:
     files: list[Path] = []
     for input_path in inputs:
@@ -143,6 +158,20 @@ def semantic_activity_runs_from_data(
 
     start_date = date.fromisoformat(date_filter[0]) if date_filter is not None else None
     end_date = date.fromisoformat(date_filter[1]) if date_filter is not None else None
+    path_points: list[TrackPoint] = []
+    for segment in data["semanticSegments"]:
+        if not isinstance(segment, dict) or not isinstance(segment.get("timelinePath"), list):
+            continue
+        for sample in segment["timelinePath"]:
+            if not isinstance(sample, dict):
+                continue
+            timestamp = parse_timestamp(sample.get("time"))
+            point = make_point(parse_coordinates(sample.get("point")), timestamp)
+            if point is not None and timestamp is not None:
+                path_points.append(point)
+    path_points.sort(key=lambda point: point.timestamp)
+    path_times = [point.timestamp for point in path_points]
+
     runs: list[list[TrackPoint]] = []
     for segment in data["semanticSegments"]:
         if not isinstance(segment, dict):
@@ -152,24 +181,49 @@ def semantic_activity_runs_from_data(
         if not isinstance(candidate, dict) or candidate.get("type") not in ACTIVITY_TYPES[mode]:
             continue
 
-        points: list[TrackPoint] = []
-        for endpoint, timestamp_key in (("start", "startTime"), ("end", "endTime")):
-            raw_timestamp = segment.get(timestamp_key)
-            timestamp = parse_timestamp(raw_timestamp)
-            calendar_date = parse_timestamp_date(raw_timestamp)
-            if timestamp is None or calendar_date is None:
+        raw_start = segment.get("startTime")
+        raw_end = segment.get("endTime")
+        start_time = parse_timestamp(raw_start)
+        end_time = parse_timestamp(raw_end)
+        start_calendar_date = parse_timestamp_date(raw_start)
+        end_calendar_date = parse_timestamp_date(raw_end)
+        if None in (start_time, end_time, start_calendar_date, end_calendar_date):
+            continue
+        if start_date is not None and end_date is not None:
+            if end_calendar_date < start_date or start_calendar_date > end_date:
                 continue
-            if start_date is not None and end_date is not None:
-                if not (start_date <= calendar_date <= end_date):
-                    continue
+
+        first_path_point = bisect.bisect_left(path_times, start_time)
+        after_last_path_point = bisect.bisect_right(path_times, end_time)
+        matching_path_points = path_points[first_path_point:after_last_path_point]
+        trip_points: list[TrackPoint] = []
+        for endpoint, timestamp in (("start", start_time), ("end", end_time)):
             location = activity.get(endpoint)
             coordinates = parse_coordinates(location.get("latLng")) if isinstance(location, dict) else None
             point = make_point(coordinates, timestamp)
+            if point is not None and matching_path_points:
+                nearest = min(
+                    matching_path_points,
+                    key=lambda sample: abs((sample.timestamp - timestamp).total_seconds()),
+                )
+                elapsed_seconds = abs((nearest.timestamp - timestamp).total_seconds())
+                maximum_distance = (
+                    ACTIVITY_ENDPOINT_TOLERANCE_METERS
+                    + elapsed_seconds * MAX_ACTIVITY_ENDPOINT_SPEED_METERS_PER_SECOND
+                )
+                if distance_meters(point, nearest) > maximum_distance:
+                    continue
             if point is not None:
-                points.append(point)
+                trip_points.append(point)
 
+        trip_points.extend(matching_path_points)
+        trip_points.sort(key=lambda point: point.timestamp)
+
+        points: list[TrackPoint] = []
+        for point in trip_points:
+            if not points or (point.latitude, point.longitude) != (points[-1].latitude, points[-1].longitude):
+                points.append(point)
         if len(points) >= 2:
-            points.sort(key=lambda point: point.timestamp or datetime.min.replace(tzinfo=timezone.utc))
             runs.append(points)
     return runs
 
@@ -260,7 +314,7 @@ def project_point_to_segment(
     return (x1 + projection * dx, y1 + projection * dy)
 
 
-def snap_chunk(points: list[TrackPoint], api_key: str | None = None) -> list[tuple[float, float]]:
+def snap_chunk(points: list[TrackPoint]) -> list[tuple[float, float]]:
     if not points:
         return []
     if len(points) < 3:
@@ -279,13 +333,35 @@ def snap_chunk(points: list[TrackPoint], api_key: str | None = None) -> list[tup
     return snapped
 
 
-def snap_runs(runs: list[list[TrackPoint]], api_key: str | None = None) -> list[list[tuple[float, float]]]:
+def snap_runs(runs: list[list[TrackPoint]]) -> list[list[tuple[float, float]]]:
     snapped_runs: list[list[tuple[float, float]]] = []
     for run in runs:
-        if len(run) < 2:
-            continue
-        snapped_runs.append(snap_chunk(run, api_key))
+        for chunk in split_track_at_gaps(run):
+            snapped_runs.append(snap_chunk(chunk))
     return snapped_runs
+
+
+def split_track_at_gaps(points: list[TrackPoint]) -> list[list[TrackPoint]]:
+    if not points:
+        return []
+    chunks: list[list[TrackPoint]] = []
+    current = [points[0]]
+    for point in points[1:]:
+        previous = current[-1]
+        elapsed = (point.timestamp - previous.timestamp).total_seconds() if point.timestamp and previous.timestamp else 0
+        maximum_distance = max(
+            ACTIVITY_ENDPOINT_TOLERANCE_METERS,
+            elapsed * MAX_ACTIVITY_ENDPOINT_SPEED_METERS_PER_SECOND,
+        )
+        if elapsed > MAX_TRACK_GAP_SECONDS or distance_meters(previous, point) > maximum_distance:
+            if len(current) >= 2:
+                chunks.append(current)
+            current = [point]
+        else:
+            current.append(point)
+    if len(current) >= 2:
+        chunks.append(current)
+    return chunks
 
 
 def write_kml(routes: Iterable[list[tuple[float, float]]], output_path: Path, track_name: str) -> int:
@@ -333,7 +409,7 @@ def main() -> int:
     activity_group = parser.add_mutually_exclusive_group(required=True)
     activity_group.add_argument("-c", "--car", action="store_const", const="car", dest="mode", help="Select car/vehicle activity")
     activity_group.add_argument("-b", "--bike", action="store_const", const="bike", dest="mode", help="Select bicycle activity")
-    parser.add_argument("-s", "--snap", action="store_true", help="Snap recorded points to the nearest OpenStreetMap road nodes")
+    parser.add_argument("-s", "--snap", action="store_true", help="Smooth GPS jitter locally and split impossible jumps")
     arguments = parser.parse_args()
 
     try:
