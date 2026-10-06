@@ -6,33 +6,29 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
-import math
+import logging
 import re
 import sys
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from route_geometry import (
+    ACTIVITY_ENDPOINT_TOLERANCE_METERS,
+    MAX_ACTIVITY_ENDPOINT_SPEED_METERS_PER_SECOND,
+    TrackPoint,
+    distance_meters,
+)
+from snap_strategies import SNAP_STRATEGIES, SnapOptions, snap_runs
+
 
 KML_NAMESPACE = "http://www.opengis.net/kml/2.2"
-MAX_SNAP_OFFSET_DEGREES = 1.5e-4
-MAX_ACTIVITY_ENDPOINT_SPEED_METERS_PER_SECOND = 70
-ACTIVITY_ENDPOINT_TOLERANCE_METERS = 1000
-MAX_TRACK_GAP_SECONDS = 900
 ACTIVITY_TYPES = {
     "car": {"IN_ROAD_VEHICLE", "IN_VEHICLE", "IN_PASSENGER_VEHICLE"},
     "bike": {"ON_BICYCLE", "CYCLING"},
 }
 ET.register_namespace("", KML_NAMESPACE)
-
-
-@dataclass(frozen=True)
-class TrackPoint:
-    latitude: float
-    longitude: float
-    timestamp: datetime | None = None
 
 
 def parse_timestamp(value: Any, milliseconds: bool = False) -> datetime | None:
@@ -98,18 +94,6 @@ def make_point(
     if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
         return None
     return TrackPoint(latitude, longitude, timestamp)
-
-
-def distance_meters(first: TrackPoint, second: TrackPoint) -> float:
-    latitude1 = math.radians(first.latitude)
-    latitude2 = math.radians(second.latitude)
-    latitude_delta = latitude2 - latitude1
-    longitude_delta = math.radians(second.longitude - first.longitude)
-    haversine = (
-        math.sin(latitude_delta / 2) ** 2
-        + math.cos(latitude1) * math.cos(latitude2) * math.sin(longitude_delta / 2) ** 2
-    )
-    return 12_742_000 * math.asin(math.sqrt(haversine))
 
 
 def input_json_files(inputs: Iterable[Path]) -> list[Path]:
@@ -298,72 +282,6 @@ def activity_runs_from_data(data: Any, mode: str, date_filter: tuple[str, str] |
     return raw_runs if raw_runs else semantic_activity_runs_from_data(data, mode, date_filter)
 
 
-def project_point_to_segment(
-    point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]
-) -> tuple[float, float]:
-    x, y = point
-    x1, y1 = start
-    x2, y2 = end
-    dx = x2 - x1
-    dy = y2 - y1
-    if dx == 0 and dy == 0:
-        return start
-    length_sq = dx * dx + dy * dy
-    projection = ((x - x1) * dx + (y - y1) * dy) / length_sq
-    projection = max(0.0, min(1.0, projection))
-    return (x1 + projection * dx, y1 + projection * dy)
-
-
-def snap_chunk(points: list[TrackPoint]) -> list[tuple[float, float]]:
-    if not points:
-        return []
-    if len(points) < 3:
-        return [(point.latitude, point.longitude) for point in points]
-
-    snapped: list[tuple[float, float]] = [(point.latitude, point.longitude) for point in points]
-    for index in range(1, len(points) - 1):
-        previous = (points[index - 1].latitude, points[index - 1].longitude)
-        current = (points[index].latitude, points[index].longitude)
-        next_point = (points[index + 1].latitude, points[index + 1].longitude)
-        projected = project_point_to_segment(current, previous, next_point)
-        dx = projected[0] - current[0]
-        dy = projected[1] - current[1]
-        if math.hypot(dx, dy) <= MAX_SNAP_OFFSET_DEGREES:
-            snapped[index] = projected
-    return snapped
-
-
-def snap_runs(runs: list[list[TrackPoint]]) -> list[list[tuple[float, float]]]:
-    snapped_runs: list[list[tuple[float, float]]] = []
-    for run in runs:
-        for chunk in split_track_at_gaps(run):
-            snapped_runs.append(snap_chunk(chunk))
-    return snapped_runs
-
-
-def split_track_at_gaps(points: list[TrackPoint]) -> list[list[TrackPoint]]:
-    if not points:
-        return []
-    chunks: list[list[TrackPoint]] = []
-    current = [points[0]]
-    for point in points[1:]:
-        previous = current[-1]
-        elapsed = (point.timestamp - previous.timestamp).total_seconds() if point.timestamp and previous.timestamp else 0
-        maximum_distance = max(
-            ACTIVITY_ENDPOINT_TOLERANCE_METERS,
-            elapsed * MAX_ACTIVITY_ENDPOINT_SPEED_METERS_PER_SECOND,
-        )
-        if elapsed > MAX_TRACK_GAP_SECONDS or distance_meters(previous, point) > maximum_distance:
-            if len(current) >= 2:
-                chunks.append(current)
-            current = [point]
-        else:
-            current.append(point)
-    if len(current) >= 2:
-        chunks.append(current)
-    return chunks
-
-
 def write_kml(routes: Iterable[list[tuple[float, float]]], output_path: Path, track_name: str) -> int:
     namespace = KML_NAMESPACE
     root = ET.Element(f"{{{namespace}}}kml")
@@ -396,7 +314,7 @@ def write_kml(routes: Iterable[list[tuple[float, float]]], output_path: Path, tr
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Export selected Google Timeline activity samples as KML, optionally snapped to roads."
+        description="Export selected Google Timeline activity samples as KML, optionally processed by a snapping strategy."
     )
     parser.add_argument("input", nargs="+", type=Path, help="JSON file(s) or folder(s) containing JSON")
     parser.add_argument("output", type=Path, help="Output KML file for Google My Maps")
@@ -409,8 +327,30 @@ def main() -> int:
     activity_group = parser.add_mutually_exclusive_group(required=True)
     activity_group.add_argument("-c", "--car", action="store_const", const="car", dest="mode", help="Select car/vehicle activity")
     activity_group.add_argument("-b", "--bike", action="store_const", const="bike", dest="mode", help="Select bicycle activity")
-    parser.add_argument("-s", "--snap", action="store_true", help="Smooth GPS jitter locally and split impossible jumps")
+    parser.add_argument("-s", "--snap", action="store_true", help="Apply the selected snapping strategy")
+    parser.add_argument(
+        "-S",
+        "--snap-strategy",
+        choices=sorted(SNAP_STRATEGIES),
+        default="local",
+        help="Snapping strategy to use with --snap (default: local)",
+    )
+    parser.add_argument(
+        "--osm-cache-dir",
+        type=Path,
+        default=Path.home() / ".cache" / "map-visualizer" / "osm",
+        help="Persistent cache directory for the mappymatch OSM road tiles",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show OSM tile cache hits and detailed snapping diagnostics",
+    )
     arguments = parser.parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if arguments.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
 
     try:
         date_filter = parse_date_filter(arguments.date)
@@ -425,7 +365,14 @@ def main() -> int:
             label = f"for {date_filter[0]} to {date_filter[1]}" if date_filter else ""
             raise ValueError(f"No {arguments.mode} activity samples with usable GPS positions were found {label}".strip())
         if arguments.snap:
-            routes = snap_runs(runs)
+            routes = snap_runs(
+                runs,
+                arguments.snap_strategy,
+                SnapOptions(
+                    osm_cache_dir=arguments.osm_cache_dir,
+                    network_type="bike" if arguments.mode == "bike" else "drive",
+                ),
+            )
         else:
             routes = [
                 [(point.latitude, point.longitude) for point in run]

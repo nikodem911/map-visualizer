@@ -1,21 +1,27 @@
 import json
+import math
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from pyproj import CRS, Transformer
+from shapely.geometry import LineString
+
+from route_geometry import TrackPoint
 from location_history_to_kml import (
-    TrackPoint,
     activity_runs_from_data,
     input_json_files,
     main,
     parse_date_filter,
-    snap_chunk,
-    snap_runs,
     write_kml,
 )
+from snap_strategies import snap_runs
+from snap_strategies.local import snap_chunk
+from snap_strategies.mappymatch import OSMTileCache, SnapOptions
 
 
 class LocationHistoryRoutesTests(unittest.TestCase):
@@ -222,7 +228,7 @@ class LocationHistoryRoutesTests(unittest.TestCase):
 
     def test_snap_runs_uses_one_call_per_run(self):
         points = [TrackPoint(40.0 + index / 10_000, -73.0) for index in range(103)]
-        with patch("location_history_to_kml.snap_chunk", side_effect=lambda chunk: [(p.latitude, p.longitude) for p in chunk]) as snap:
+        with patch("snap_strategies.local.snap_chunk", side_effect=lambda chunk: [(p.latitude, p.longitude) for p in chunk]) as snap:
             snap_runs([points])
 
         self.assertEqual(len(snap.call_args_list), 1)
@@ -237,13 +243,201 @@ class LocationHistoryRoutesTests(unittest.TestCase):
             TrackPoint(48.001, 17.001, start + timedelta(minutes=2)),
         ]
 
-        with patch("location_history_to_kml.snap_chunk", side_effect=lambda chunk: [(p.latitude, p.longitude) for p in chunk]) as snap:
+        with patch("snap_strategies.local.snap_chunk", side_effect=lambda chunk: [(p.latitude, p.longitude) for p in chunk]) as snap:
             routes = snap_runs([points])
 
         self.assertEqual(len(routes), 2)
         self.assertEqual(len(snap.call_args_list), 2)
         self.assertEqual(routes[0], [(49.0, 19.0), (49.001, 19.001)])
         self.assertEqual(routes[1], [(48.0, 17.0), (48.001, 17.001)])
+
+    def test_snap_runs_deduplicates_same_road_but_keeps_parallel_road(self):
+        runs = [
+            [TrackPoint(49.0, 19.0), TrackPoint(49.0, 19.01)],
+            [TrackPoint(49.00003, 19.0), TrackPoint(49.00003, 19.01)],
+            [TrackPoint(49.00003, 19.01), TrackPoint(49.00003, 19.0)],
+            [TrackPoint(49.00045, 19.0), TrackPoint(49.00045, 19.01)],
+        ]
+
+        routes = snap_runs(runs)
+
+        self.assertEqual(len(routes), 2)
+        self.assertEqual(routes[0], [(49.0, 19.0), (49.0, 19.01)])
+        self.assertEqual(routes[1], [(49.00045, 19.0), (49.00045, 19.01)])
+
+    def test_snap_runs_keeps_unique_part_of_partially_repeated_route(self):
+        runs = [
+            [TrackPoint(49.0, 19.0), TrackPoint(49.0, 19.01)],
+            [TrackPoint(49.0, 19.003), TrackPoint(49.0, 19.01), TrackPoint(49.003, 19.01)],
+        ]
+
+        routes = snap_runs(runs)
+
+        self.assertEqual(len(routes), 2)
+        self.assertEqual(routes[1], [(49.0, 19.01), (49.003, 19.01)])
+
+    def test_cli_dispatches_selected_snap_strategy(self):
+        data = {
+            "rawSignals": [
+                {
+                    "activityRecord": {
+                        "timestamp": "2024-01-01T08:00:00Z",
+                        "probableActivities": [{"type": "IN_ROAD_VEHICLE", "confidence": 0.9}],
+                    }
+                },
+                {"position": {"timestamp": "2024-01-01T08:00:01Z", "LatLng": "geo:40.0,-73.0"}},
+                {"position": {"timestamp": "2024-01-01T08:00:02Z", "LatLng": "geo:40.0001,-73.0001"}},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "timeline.json"
+            output = Path(directory) / "route.kml"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            with patch(
+                "sys.argv",
+                ["location_history_to_kml.py", str(source), str(output), "--car", "--snap", "-S", "local"],
+            ), patch("location_history_to_kml.snap_runs", return_value=[[(40.0, -73.0), (40.1, -73.1)]]) as snap:
+                self.assertEqual(main(), 0)
+
+        self.assertEqual(snap.call_args.args[1], "local")
+
+    def test_osm_tile_cache_persists_and_reuses_downloaded_map(self):
+        class FakeMap:
+            downloads = 0
+            loads = 0
+
+            def __init__(self):
+                self.g = object()
+
+            @classmethod
+            def from_geofence(cls, *_args, **_kwargs):
+                cls.downloads += 1
+                return cls()
+
+            @classmethod
+            def from_file(cls, _path):
+                cls.loads += 1
+                return cls()
+
+            def to_file(self, path):
+                Path(path).write_bytes(b"cached OSM graph")
+
+        class FakeGeofence:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeNetworkType:
+            DRIVE = SimpleNamespace(value="drive")
+            BIKE = SimpleNamespace(value="bike")
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = OSMTileCache(Path(directory))
+            cache.get_tile_map((98, 38), FakeMap, FakeGeofence, FakeNetworkType.DRIVE)
+            disk_cache = OSMTileCache(Path(directory))
+            disk_cache.get_tile_map((98, 38), FakeMap, FakeGeofence, FakeNetworkType.DRIVE)
+
+        self.assertEqual(FakeMap.downloads, 1)
+        self.assertEqual(FakeMap.loads, 1)
+        self.assertEqual(cache.fetch_attempts, 1)
+        self.assertEqual(disk_cache.disk_cache_hits, 1)
+
+    def test_osm_tile_fetch_error_includes_attempt_number_and_cause(self):
+        class FakeNetworkType:
+            DRIVE = SimpleNamespace(value="drive")
+
+        class FakeGeofence:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeMap:
+            @classmethod
+            def from_geofence(cls, *_args, **_kwargs):
+                raise ConnectionError("connection refused")
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = OSMTileCache(Path(directory))
+            with self.assertLogs("snap_strategies.mappymatch", level="ERROR") as log_output:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"OSM tile fetch #1 failed.*ConnectionError: connection refused",
+                ):
+                    cache.get_tile_map((99, 38), FakeMap, FakeGeofence, FakeNetworkType.DRIVE)
+
+        self.assertEqual(cache.fetch_attempts, 1)
+        self.assertEqual(cache.fetch_failures, 1)
+        self.assertTrue(any("OSM tile fetch #1 failed" in message for message in log_output.output))
+
+    def test_mappymatch_strategy_reuses_map_and_returns_road_geometry(self):
+        class FakeNetworkType:
+            DRIVE = SimpleNamespace(value="drive")
+            BIKE = SimpleNamespace(value="bike")
+
+        class FakeGeofence:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeMap:
+            downloads = 0
+            requested_networks = []
+
+            def __init__(self, graph=None):
+                self.g = graph or object()
+                self.crs = CRS.from_epsg(3857)
+
+            @classmethod
+            def from_geofence(cls, _geofence, **kwargs):
+                cls.downloads += 1
+                cls.requested_networks.append(kwargs["network_type"].value)
+                return cls()
+
+            @classmethod
+            def from_file(cls, _path):
+                return cls()
+
+            def to_file(self, path):
+                Path(path).write_bytes(b"cached OSM graph")
+
+        class FakeTrace:
+            @classmethod
+            def from_dataframe(cls, frame, xy=True):
+                return frame
+
+        class FakeMatcher:
+            calls = 0
+
+            def __init__(self, _road_map, **_kwargs):
+                pass
+
+            def match_trace(self, _trace):
+                type(self).calls += 1
+                project = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
+                road = LineString([project(19.0, 49.0), project(19.01, 49.0)])
+                return SimpleNamespace(path=[SimpleNamespace(geom=road)], matches=[])
+
+        fake_networkx = SimpleNamespace(compose_all=lambda graphs: graphs[0])
+        start = datetime(2024, 8, 1, tzinfo=timezone.utc)
+        run = [
+            TrackPoint(49.0, 19.0, start),
+            TrackPoint(49.0, 19.005, start + timedelta(minutes=1)),
+            TrackPoint(49.0, 19.01, start + timedelta(minutes=2)),
+        ]
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "snap_strategies.mappymatch._mappymatch_components",
+            return_value=(FakeGeofence, FakeTrace, FakeMap, FakeNetworkType, FakeMatcher, fake_networkx),
+        ):
+            routes = snap_runs(
+                [run, run],
+                "mappymatch",
+                SnapOptions(Path(directory), network_type="bike"),
+            )
+
+        self.assertEqual(FakeMap.downloads, 1)
+        self.assertEqual(FakeMap.requested_networks, ["bike"])
+        self.assertEqual(FakeMatcher.calls, 2)
+        self.assertEqual(len(routes), 1)
+        self.assertTrue(math.isclose(routes[0][0][0], 49.0, abs_tol=1e-6))
+        self.assertTrue(math.isclose(routes[0][-1][1], 19.01, abs_tol=1e-6))
 
     def test_without_snap_writes_recorded_points_without_an_api_key(self):
         data = {

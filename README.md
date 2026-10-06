@@ -15,7 +15,13 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-The script uses only the Python standard library. To leave the virtual environment when finished, run `deactivate`.
+Install the project dependencies into the activated virtual environment:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+This installs Mappymatch and its GIS dependencies for OSM road matching. The `local` snapping strategy itself uses only the Python standard library. To leave the virtual environment when finished, run `deactivate`.
 
 ## Export for Google My Maps
 
@@ -38,10 +44,16 @@ The date filter uses the calendar date written in each timestamp, regardless of 
 To smooth only minor GPS jitter without needing any external API, run the export with `--snap`.
 
 ```bash
-python3 location_history_to_kml.py .tmp/timeline_august_2026.json august-car-snapped.kml --car --snap --name "August 2026 driving"
+python3 location_history_to_kml.py .tmp/timeline_august_2026.json august-car-snapped.kml --car --snap --snap-strategy local --name "August 2026 driving"
 ```
 
-`--snap` is entirely local. It smooths only minor GPS jitter, and splits a route at time gaps or physically impossible jumps rather than drawing a line across them. It does not download map data or match points against a road network.
+`--snap-strategy` (`-S`) selects the strategy used by `--snap`. It defaults to `local`. The local strategy smooths only minor GPS jitter, splits a route at time gaps or physically impossible jumps rather than drawing a line across them, and suppresses road sections already covered by earlier trips when at least 70% of an edge is within 35 meters of the earlier trace. It recognizes travel in either direction; nearby parallel roads farther apart than the tolerance remain separate. It does not download map data or match points against a road network. The optional `mappymatch` strategy matches traces against locally cached OpenStreetMap driving roads.
+
+To match routes to local OpenStreetMap road data with Mappymatch, select the `mappymatch` strategy:
+
+```bash
+python3 location_history_to_kml.py .tmp/timeline.json august-car-matched.kml --car --date 2024-08-01:2024-08-31 --snap -S mappymatch --name "August 2024 driving"
+```
 
 The `--car` option selects vehicle activities; `--bike` selects bicycle activities. In `rawSignals` exports, timestamped activity records classify nearby GPS samples. In `semanticSegments` exports, matching activity segments include their start/end coordinates and any timestamped `timelinePath` samples during the trip.
 
