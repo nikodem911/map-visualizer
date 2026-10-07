@@ -10,7 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from route_geometry import TrackPoint, distance_meters
 from snap_strategies.common import (
@@ -21,10 +21,11 @@ from snap_strategies.common import (
 )
 
 
-OSM_TILE_DEGREES = 0.5
+OSM_TILE_DEGREES = 1.0
 OSM_TILE_PADDING_DEGREES = 0.02
 OSM_TILE_SAMPLE_DISTANCE_METERS = 8_000
-OSM_TILE_MEMORY_CACHE_SIZE = 8
+OSM_TILE_MEMORY_CACHE_SIZE = 64
+OSM_TILE_MEMORY_CACHE_HARD_CAP = 256
 MAPPY_TRACE_CHUNK_SIZE = 250
 MAPPY_MATCH_MAX_DISTANCE_METERS = 10_000
 logger = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ def _mappymatch_components() -> tuple[Any, Any, Any, Any, Any, Any]:
 class OSMTileCache:
     def __init__(self, cache_dir: Path | None = None) -> None:
         self.cache_dir = cache_dir or Path.home() / ".cache" / "map-visualizer" / "osm"
+        self.tile_degrees = OSM_TILE_DEGREES
+        self.memory_cache_size = OSM_TILE_MEMORY_CACHE_SIZE
         self._memory_cache: OrderedDict[tuple[str, int, int], Any] = OrderedDict()
         self._combined_cache: OrderedDict[tuple[str, tuple[tuple[int, int], ...]], Any] = OrderedDict()
         self.fetch_attempts = 0
@@ -63,11 +66,10 @@ class OSMTileCache:
         self.memory_cache_hits = 0
         self.disk_cache_hits = 0
 
-    @staticmethod
-    def tile_for_point(point: TrackPoint) -> tuple[int, int]:
+    def tile_for_point(self, point: TrackPoint) -> tuple[int, int]:
         return (
-            math.floor(point.latitude / OSM_TILE_DEGREES),
-            math.floor(point.longitude / OSM_TILE_DEGREES),
+            math.floor(point.latitude / self.tile_degrees),
+            math.floor(point.longitude / self.tile_degrees),
         )
 
     def tiles_for_trace(self, points: list[TrackPoint]) -> tuple[tuple[int, int], ...]:
@@ -99,7 +101,7 @@ class OSMTileCache:
         endpoint_id = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:12]
         folder = self.cache_dir / (
             f"mappymatch-{mappymatch_version}-osmnx-{osmnx_version}-"
-            f"{network_type.value}-{endpoint_id}-v3"
+            f"{network_type.value}-{endpoint_id}-tile{self.tile_degrees:g}-v3"
         )
         return folder / f"{tile[0]}_{tile[1]}.pickle"
 
@@ -130,10 +132,10 @@ class OSMTileCache:
         from shapely.geometry import box
 
         latitude_index, longitude_index = tile
-        minimum_latitude = max(-85.0, latitude_index * OSM_TILE_DEGREES - OSM_TILE_PADDING_DEGREES)
-        maximum_latitude = min(85.0, (latitude_index + 1) * OSM_TILE_DEGREES + OSM_TILE_PADDING_DEGREES)
-        minimum_longitude = max(-180.0, longitude_index * OSM_TILE_DEGREES - OSM_TILE_PADDING_DEGREES)
-        maximum_longitude = min(180.0, (longitude_index + 1) * OSM_TILE_DEGREES + OSM_TILE_PADDING_DEGREES)
+        minimum_latitude = max(-85.0, latitude_index * self.tile_degrees - OSM_TILE_PADDING_DEGREES)
+        maximum_latitude = min(85.0, (latitude_index + 1) * self.tile_degrees + OSM_TILE_PADDING_DEGREES)
+        minimum_longitude = max(-180.0, longitude_index * self.tile_degrees - OSM_TILE_PADDING_DEGREES)
+        maximum_longitude = min(180.0, (longitude_index + 1) * self.tile_degrees + OSM_TILE_PADDING_DEGREES)
         geofence = geofence_type(
             crs=CRS.from_epsg(4326),
             geometry=box(minimum_longitude, minimum_latitude, maximum_longitude, maximum_latitude),
@@ -196,9 +198,28 @@ class OSMTileCache:
     def _remember_tile(self, cache_key: tuple[str, int, int], tile_map: Any) -> Any:
         self._memory_cache[cache_key] = tile_map
         self._memory_cache.move_to_end(cache_key)
-        while len(self._memory_cache) > OSM_TILE_MEMORY_CACHE_SIZE:
+        while len(self._memory_cache) > self.memory_cache_size:
             self._memory_cache.popitem(last=False)
         return tile_map
+
+    def prefetch_tiles(
+        self,
+        tiles: Iterable[tuple[int, int]],
+        nx_map_type: Any,
+        geofence_type: Any,
+        network_type: Any,
+    ) -> None:
+        """Warm the tile cache for a whole batch of trips up front.
+
+        Sizing the in-memory cache to fit every tile needed by the batch (up to a hard
+        cap) avoids repeatedly evicting and re-fetching/re-loading tiles that are shared
+        by multiple trips covering similar areas.
+        """
+        unique_tiles = sorted(set(tiles))
+        if len(unique_tiles) > self.memory_cache_size:
+            self.memory_cache_size = min(len(unique_tiles), OSM_TILE_MEMORY_CACHE_HARD_CAP)
+        for tile in unique_tiles:
+            self.get_tile_map(tile, nx_map_type, geofence_type, network_type)
 
     def get_combined_map(
         self,
@@ -303,35 +324,52 @@ def snap_runs_mappymatch(runs: list[list[TrackPoint]], options: SnapOptions) -> 
     seen_road_samples: dict[tuple[int, int], list[tuple[float, float, float, float]]] = {}
 
     try:
-        for run in runs:
-            for chunk in _split_match_chunks(run):
-                tiles = map_cache.tiles_for_trace(chunk)
-                network_type = getattr(NetworkType, options.network_type.upper(), None)
-                if network_type is None:
-                    raise ValueError(f"Unsupported Mappymatch OSM network type: {options.network_type}")
-                road_map = map_cache.get_combined_map(tiles, NxMap, Geofence, network_type, nx)
-                import pandas as pd
+        network_type = getattr(NetworkType, options.network_type.upper(), None)
+        if network_type is None:
+            raise ValueError(f"Unsupported Mappymatch OSM network type: {options.network_type}")
 
-                trace_frame = pd.DataFrame(
-                    {
-                        "latitude": [point.latitude for point in chunk],
-                        "longitude": [point.longitude for point in chunk],
-                    },
-                    index=[point.timestamp for point in chunk],
-                )
-                trace = Trace.from_dataframe(trace_frame, xy=True)
-                matcher = LCSSMatcher(
-                    road_map,
-                    distance_epsilon=50,
-                    similarity_cutoff=0.85,
-                    distance_threshold=MAPPY_MATCH_MAX_DISTANCE_METERS,
-                )
-                matched_routes = _coordinates_from_match_result(matcher.match_trace(trace), road_map)
-                for route in matched_routes:
-                    unique_routes = deduplicate_route_edges(route, seen_road_samples)
-                    for unique_route in unique_routes:
-                        index_route_edges(unique_route, seen_road_samples)
-                    snapped_runs.extend(unique_routes)
+        # Precompute every chunk's tiles up front (instead of per-chunk inside the
+        # match loop) so the union of tiles needed by the whole batch of runs can be
+        # prefetched once. Trips that revisit the same area reuse the same cached
+        # tiles instead of each triggering their own OSM fetch.
+        chunks_with_tiles = [
+            (chunk, map_cache.tiles_for_trace(chunk))
+            for run in runs
+            for chunk in _split_match_chunks(run)
+        ]
+        unique_tiles = {tile for _, tiles in chunks_with_tiles for tile in tiles}
+        logger.info(
+            "Mappymatch prefetching %d unique OSM tile(s) (tile size=%.2f deg) for %d chunk(s)",
+            len(unique_tiles),
+            map_cache.tile_degrees,
+            len(chunks_with_tiles),
+        )
+        map_cache.prefetch_tiles(unique_tiles, NxMap, Geofence, network_type)
+
+        for chunk, tiles in chunks_with_tiles:
+            road_map = map_cache.get_combined_map(tiles, NxMap, Geofence, network_type, nx)
+            import pandas as pd
+
+            trace_frame = pd.DataFrame(
+                {
+                    "latitude": [point.latitude for point in chunk],
+                    "longitude": [point.longitude for point in chunk],
+                },
+                index=[point.timestamp for point in chunk],
+            )
+            trace = Trace.from_dataframe(trace_frame, xy=True)
+            matcher = LCSSMatcher(
+                road_map,
+                distance_epsilon=50,
+                similarity_cutoff=0.85,
+                distance_threshold=MAPPY_MATCH_MAX_DISTANCE_METERS,
+            )
+            matched_routes = _coordinates_from_match_result(matcher.match_trace(trace), road_map)
+            for route in matched_routes:
+                unique_routes = deduplicate_route_edges(route, seen_road_samples)
+                for unique_route in unique_routes:
+                    index_route_edges(unique_route, seen_road_samples)
+                snapped_runs.extend(unique_routes)
     finally:
         map_cache.log_summary()
         ox.settings.overpass_url = original_overpass_url
