@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import osmnx as ox
 from pyproj import CRS, Transformer
 from shapely.geometry import LineString
 
@@ -379,6 +380,7 @@ class LocationHistoryRoutesTests(unittest.TestCase):
         class FakeMap:
             downloads = 0
             requested_networks = []
+            requested_endpoints = []
 
             def __init__(self, graph=None):
                 self.g = graph or object()
@@ -388,6 +390,7 @@ class LocationHistoryRoutesTests(unittest.TestCase):
             def from_geofence(cls, _geofence, **kwargs):
                 cls.downloads += 1
                 cls.requested_networks.append(kwargs["network_type"].value)
+                cls.requested_endpoints.append(ox.settings.overpass_url)
                 return cls()
 
             @classmethod
@@ -421,19 +424,26 @@ class LocationHistoryRoutesTests(unittest.TestCase):
             TrackPoint(49.0, 19.005, start + timedelta(minutes=1)),
             TrackPoint(49.0, 19.01, start + timedelta(minutes=2)),
         ]
+        original_overpass_url = ox.settings.overpass_url
 
         with tempfile.TemporaryDirectory() as directory, patch(
             "snap_strategies.mappymatch._mappymatch_components",
             return_value=(FakeGeofence, FakeTrace, FakeMap, FakeNetworkType, FakeMatcher, fake_networkx),
-        ):
+        ), patch.object(ox.settings, "overpass_url", ox.settings.overpass_url):
             routes = snap_runs(
                 [run, run],
                 "mappymatch",
-                SnapOptions(Path(directory), network_type="bike"),
+                SnapOptions(
+                    Path(directory),
+                    network_type="bike",
+                    overpass_url="http://127.0.0.1:12345/api/",
+                ),
             )
+            self.assertEqual(ox.settings.overpass_url, original_overpass_url)
 
         self.assertEqual(FakeMap.downloads, 1)
         self.assertEqual(FakeMap.requested_networks, ["bike"])
+        self.assertEqual(FakeMap.requested_endpoints, ["http://127.0.0.1:12345/api"])
         self.assertEqual(FakeMatcher.calls, 2)
         self.assertEqual(len(routes), 1)
         self.assertTrue(math.isclose(routes[0][0][0], 49.0, abs_tol=1e-6))

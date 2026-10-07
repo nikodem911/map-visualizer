@@ -55,6 +55,45 @@ To match routes to local OpenStreetMap road data with Mappymatch, select the `ma
 python3 location_history_to_kml.py .tmp/timeline.json august-car-matched.kml --car --date 2024-08-01:2024-08-31 --snap -S mappymatch --name "August 2024 driving"
 ```
 
+### Use a Local Overpass Docker Server
+
+To avoid relying on the public Overpass service, you can run a regional Overpass instance locally with the community [`wiktorn/overpass-api`](https://hub.docker.com/r/wiktorn/overpass-api) image. This example initializes a persistent server from a Geofabrik Poland extract, bound to localhost only. Change the extract URLs and volume name to a region that contains all the trips you intend to match.
+
+```bash
+mkdir -p "$HOME/.local/share/overpass-poland"
+docker run -d \
+	--name overpass-local \
+	-p 127.0.0.1:12345:80 \
+	-v "$HOME/.local/share/overpass-poland:/db" \
+	-e OVERPASS_MODE=init \
+	-e OVERPASS_META=no \
+	-e OVERPASS_PLANET_URL=https://download.geofabrik.de/europe/poland-latest.osm.pbf \
+	-e 'OVERPASS_PLANET_PREPROCESS=mv /db/planet.osm.bz2 /db/planet.osm.pbf && osmium cat -o /db/planet.osm.bz2 /db/planet.osm.pbf && rm /db/planet.osm.pbf' \
+	-e OVERPASS_DIFF_URL=https://download.geofabrik.de/europe/poland-updates/ \
+	wiktorn/overpass-api:v0.7.62.9
+```
+
+The first run downloads and imports the extract. Follow initialization with `docker logs -f overpass-local`. When initialization finishes the container exits; start it again to serve queries and apply updates:
+
+```bash
+docker start overpass-local
+docker logs -f overpass-local
+```
+
+Check that the local API responds:
+
+```bash
+curl -G --data-urlencode 'data=[out:json];node(52.0,19.0,52.001,19.001);out;' http://127.0.0.1:12345/api/interpreter
+```
+
+Pass the Overpass base URL to the exporter (use `/api`, not `/api/interpreter`):
+
+```bash
+python3 location_history_to_kml.py .tmp/timeline.json august-car-local-osm.kml --car --date 2024-08-01:2024-08-31 --snap -S mappymatch --overpass-url http://127.0.0.1:12345/api --name "August 2024 driving"
+```
+
+The database persists in `$HOME/.local/share/overpass-poland`; stop and resume it with `docker stop overpass-local` and `docker start overpass-local`. The Poland extract only covers Poland, so all matched route sections must be within that extract. For cross-border trips, choose a Geofabrik extract that covers every route or merge the required regional extracts before import. The Europe PBF is about 33 GB compressed and requires substantially more disk after import; smaller regional extracts use less. See the [Overpass image documentation](https://hub.docker.com/r/wiktorn/overpass-api) and [Geofabrik downloads](https://download.geofabrik.de/) for current usage and extract information.
+
 The `--car` option selects vehicle activities; `--bike` selects bicycle activities. In `rawSignals` exports, timestamped activity records classify nearby GPS samples. In `semanticSegments` exports, matching activity segments include their start/end coordinates and any timestamped `timelinePath` samples during the trip.
 
 Import the resulting `.kml` file into a new map at [Google My Maps](https://www.google.com/mymaps): choose **Add layer** or **Import**, then select the KML file.

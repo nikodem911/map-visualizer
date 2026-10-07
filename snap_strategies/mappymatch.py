@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import math
 import os
 import tempfile
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 class SnapOptions:
     osm_cache_dir: Path | None = None
     network_type: str = "drive"
+    overpass_url: str | None = None
 
 
 def _mappymatch_components() -> tuple[Any, Any, Any, Any, Any, Any]:
@@ -85,7 +87,7 @@ class OSMTileCache:
                 tiles.add(self.tile_for_point(point))
         return tuple(sorted(tiles))
 
-    def _tile_cache_path(self, tile: tuple[int, int], network_type: Any) -> Path:
+    def _tile_cache_path(self, tile: tuple[int, int], network_type: Any, endpoint: str) -> Path:
         try:
             mappymatch_version = version("mappymatch")
         except PackageNotFoundError:
@@ -94,7 +96,11 @@ class OSMTileCache:
             osmnx_version = version("osmnx")
         except PackageNotFoundError:
             osmnx_version = "not-installed"
-        folder = self.cache_dir / f"mappymatch-{mappymatch_version}-osmnx-{osmnx_version}-{network_type.value}-v2"
+        endpoint_id = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:12]
+        folder = self.cache_dir / (
+            f"mappymatch-{mappymatch_version}-osmnx-{osmnx_version}-"
+            f"{network_type.value}-{endpoint_id}-v3"
+        )
         return folder / f"{tile[0]}_{tile[1]}.pickle"
 
     def get_tile_map(self, tile: tuple[int, int], nx_map_type: Any, geofence_type: Any, network_type: Any) -> Any:
@@ -106,7 +112,10 @@ class OSMTileCache:
             logger.debug("OSM tile memory-cache hit: profile=%s tile=%s", network_type.value, tile)
             return cached
 
-        cache_path = self._tile_cache_path(tile, network_type)
+        import osmnx as ox
+
+        endpoint = ox.settings.overpass_url.rstrip("/")
+        cache_path = self._tile_cache_path(tile, network_type, endpoint)
         if cache_path.is_file():
             try:
                 tile_map = nx_map_type.from_file(cache_path)
@@ -129,11 +138,8 @@ class OSMTileCache:
             crs=CRS.from_epsg(4326),
             geometry=box(minimum_longitude, minimum_latitude, maximum_longitude, maximum_latitude),
         )
-        import osmnx as ox
-
         self.fetch_attempts += 1
         fetch_number = self.fetch_attempts
-        endpoint = ox.settings.overpass_url
         started_at = time.monotonic()
         logger.info(
             "OSM tile fetch #%d starting: profile=%s tile=%s endpoint=%s",
@@ -287,6 +293,11 @@ def _coordinates_from_match_result(result: Any, road_map: Any) -> list[Route]:
 
 def snap_runs_mappymatch(runs: list[list[TrackPoint]], options: SnapOptions) -> list[Route]:
     Geofence, Trace, NxMap, NetworkType, LCSSMatcher, nx = _mappymatch_components()
+    import osmnx as ox
+
+    original_overpass_url = ox.settings.overpass_url
+    if options.overpass_url:
+        ox.settings.overpass_url = options.overpass_url.rstrip("/")
     map_cache = OSMTileCache(options.osm_cache_dir)
     snapped_runs: list[Route] = []
     seen_road_samples: dict[tuple[int, int], list[tuple[float, float, float, float]]] = {}
@@ -323,4 +334,5 @@ def snap_runs_mappymatch(runs: list[list[TrackPoint]], options: SnapOptions) -> 
                     snapped_runs.extend(unique_routes)
     finally:
         map_cache.log_summary()
+        ox.settings.overpass_url = original_overpass_url
     return snapped_runs

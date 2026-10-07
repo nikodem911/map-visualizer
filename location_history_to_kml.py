@@ -342,6 +342,10 @@ def main() -> int:
         help="Persistent cache directory for the mappymatch OSM road tiles",
     )
     parser.add_argument(
+        "--overpass-url",
+        help="Overpass API base URL for mappymatch, for example http://127.0.0.1:12345/api",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Show OSM tile cache hits and detailed snapping diagnostics",
@@ -371,6 +375,7 @@ def main() -> int:
                 SnapOptions(
                     osm_cache_dir=arguments.osm_cache_dir,
                     network_type="bike" if arguments.mode == "bike" else "drive",
+                    overpass_url=arguments.overpass_url,
                 ),
             )
         else:
