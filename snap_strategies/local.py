@@ -7,6 +7,7 @@ from snap_strategies.common import (
     Route,
     deduplicate_route_edges,
     index_route_edges,
+    merge_route_with_indexed_samples,
     split_track_at_gaps,
 )
 
@@ -51,13 +52,14 @@ def snap_chunk(points: list[TrackPoint]) -> Route:
 
 def snap_runs_local(runs: list[list[TrackPoint]]) -> list[Route]:
     snapped_runs: list[Route] = []
-    seen_road_samples: dict[tuple[int, int], list[tuple[float, float, float, float]]] = {}
+    seen_road_samples: dict[tuple[int, int], list[tuple[float, float, float, float, float, float]]] = {}
     for run in runs:
         chunks = split_track_at_gaps(run)
         snapped_chunks = [snap_chunk(chunk) for chunk in chunks]
         unique_chunks: list[Route] = []
         for chunk in snapped_chunks:
-            unique_chunks.extend(deduplicate_route_edges(chunk, seen_road_samples))
+            merged_chunk = merge_route_with_indexed_samples(chunk, seen_road_samples)
+            unique_chunks.extend(deduplicate_route_edges(merged_chunk, seen_road_samples))
         for chunk in unique_chunks:
             index_route_edges(chunk, seen_road_samples)
         snapped_runs.extend(unique_chunks)
