@@ -63,6 +63,49 @@ python3 location_history_to_kml.py .tmp/timeline.json august-car-osrm.kml --car 
 
 This sends GPS coordinates and available timestamps to `https://router.project-osrm.org` and uses the returned matched road geometries. The public service is rate-limited and supports only profiles enabled by its operator. Use `--osrm-url` for another OSRM server and `--osrm-profile` to select a profile it provides; the defaults are `driving` for car and `cycling` for bike. Long runs are sent in overlapping batches of at most 50 points; if a server reports its trace limit was exceeded, the request is retried with smaller batches.
 
+### Use a Local OSRM Docker Server
+
+OSRM needs a preprocessed OpenStreetMap extract. This example uses the Poland extract; replace it with a Geofabrik extract that covers your routes. The initial download and preprocessing can take a while and require several times the PBF file size in free disk space.
+
+```bash
+mkdir -p "$HOME/.local/share/osrm-poland"
+cd "$HOME/.local/share/osrm-poland"
+wget -O region.osm.pbf https://download.geofabrik.de/europe/poland-latest.osm.pbf
+
+docker run --rm -t -v "$PWD:/data" ghcr.io/project-osrm/osrm-backend \
+	osrm-extract -p /opt/car.lua /data/region.osm.pbf
+docker run --rm -t -v "$PWD:/data" ghcr.io/project-osrm/osrm-backend \
+	osrm-partition /data/region.osrm
+docker run --rm -t -v "$PWD:/data" ghcr.io/project-osrm/osrm-backend \
+	osrm-customize /data/region.osrm
+```
+
+Start the local HTTP server using the generated dataset:
+
+```bash
+docker run -d \
+	--name osrm-local \
+	--restart unless-stopped \
+	-p 127.0.0.1:5000:5000 \
+	-v "$HOME/.local/share/osrm-poland:/data" \
+	ghcr.io/project-osrm/osrm-backend \
+	osrm-routed --algorithm mld /data/region.osrm
+```
+
+Check that the Match service responds with a route in the downloaded region:
+
+```bash
+curl 'http://127.0.0.1:5000/match/v1/driving/21.0122,52.2297;21.0130,52.2300?geometries=geojson&overview=simplified'
+```
+
+Point the exporter at the local server:
+
+```bash
+python3 location_history_to_kml.py .tmp/timeline_august_2026.json august-car-local-osrm.kml --car --date 2026-08-01 --snap -S osrm --osrm-url http://127.0.0.1:5000 --name "August 2026 local OSRM driving"
+```
+
+The container serves car routing data only because it was preprocessed with `car.lua`. For bicycle matching, preprocess a separate dataset with OSRM's bicycle profile, run another server on a different port, and set `--osrm-profile cycling` if needed by that server. View logs with `docker logs -f osrm-local`; stop and remove the server with `docker stop osrm-local && docker rm osrm-local`. The data remains in `$HOME/.local/share/osrm-poland`. See the [official OSRM Docker instructions](https://github.com/Project-OSRM/osrm-backend#using-docker) and [Geofabrik downloads](https://download.geofabrik.de/) for image usage and regional extracts.
+
 ### Use a Local Overpass Docker Server
 
 To avoid relying on the public Overpass service, you can run a regional Overpass instance locally with the community [`wiktorn/overpass-api`](https://hub.docker.com/r/wiktorn/overpass-api) image. This example initializes a persistent server from a Geofabrik Poland extract, bound to localhost only. Change the extract URLs and volume name to a region that contains all the trips you intend to match.
