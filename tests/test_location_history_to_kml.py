@@ -3,9 +3,11 @@ import math
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import osmnx as ox
@@ -23,9 +25,133 @@ from location_history_to_kml import (
 from snap_strategies import snap_runs
 from snap_strategies.local import snap_chunk
 from snap_strategies.mappymatch import OSMTileCache, SnapOptions
+from snap_strategies.osrm import snap_runs_osrm
 
 
 class LocationHistoryRoutesTests(unittest.TestCase):
+    def test_osrm_strategy_requests_match_geometry_and_converts_coordinates(self):
+        response = BytesIO(
+            json.dumps(
+                {
+                    "code": "Ok",
+                    "matchings": [
+                        {"geometry": {"type": "LineString", "coordinates": [[-73.0, 40.0], [-72.9, 40.1]]}}
+                    ],
+                }
+            ).encode("utf-8")
+        )
+        points = [
+            TrackPoint(40.0, -73.0, datetime(2024, 1, 1, tzinfo=timezone.utc)),
+            TrackPoint(40.1, -72.9, datetime(2024, 1, 1, 0, 0, 1, tzinfo=timezone.utc)),
+        ]
+
+        with patch("snap_strategies.osrm.urlopen", return_value=response) as request:
+            routes = snap_runs_osrm([points], SnapOptions())
+
+        self.assertEqual(routes, [[(40.0, -73.0), (40.1, -72.9)]])
+        request_url = request.call_args.args[0]
+        self.assertIn("/match/v1/driving/-73.000000,40.000000;-72.900000,40.100000", request_url)
+        self.assertIn("geometries=geojson", request_url)
+        self.assertIn("timestamps=1704067200%3B1704067201", request_url)
+
+    def test_osrm_strategy_stitches_overlapping_request_batches(self):
+        responses = [
+            BytesIO(
+                json.dumps(
+                    {
+                        "code": "Ok",
+                        "matchings": [
+                            {"geometry": {"type": "LineString", "coordinates": [[-73.0, 40.0], [-72.99, 40.0]]}}
+                        ],
+                    }
+                ).encode("utf-8")
+            ),
+            BytesIO(
+                json.dumps(
+                    {
+                        "code": "Ok",
+                        "matchings": [
+                            {"geometry": {"type": "LineString", "coordinates": [[-72.99, 40.0], [-72.98, 40.0]]}}
+                        ],
+                    }
+                ).encode("utf-8")
+            ),
+        ]
+        points = [TrackPoint(40.0, -73.0 + index * 0.0001) for index in range(51)]
+
+        with patch("snap_strategies.osrm.urlopen", side_effect=responses) as request:
+            routes = snap_runs_osrm([points], SnapOptions())
+
+        self.assertEqual(routes, [[(40.0, -73.0), (40.0, -72.99), (40.0, -72.98)]])
+        self.assertEqual(request.call_count, 2)
+
+    def test_osrm_strategy_retries_smaller_trace_after_too_big_response(self):
+        too_big_response = HTTPError(
+            "https://router.project-osrm.org/match",
+            400,
+            "Bad Request",
+            hdrs=None,
+            fp=BytesIO(b'{"code":"TooBig","message":"Too many trace coordinates"}'),
+        )
+        matched_responses = [
+            BytesIO(
+                json.dumps(
+                    {
+                        "code": "Ok",
+                        "matchings": [
+                            {"geometry": {"type": "LineString", "coordinates": [[-73.0, 40.0], [-72.999, 40.0]]}}
+                        ],
+                    }
+                ).encode("utf-8")
+            ),
+            BytesIO(
+                json.dumps(
+                    {
+                        "code": "Ok",
+                        "matchings": [
+                            {"geometry": {"type": "LineString", "coordinates": [[-72.999, 40.0], [-72.998, 40.0]]}}
+                        ],
+                    }
+                ).encode("utf-8")
+            ),
+        ]
+        points = [TrackPoint(40.0, -73.0 + index * 0.001) for index in range(4)]
+
+        with patch("snap_strategies.osrm.urlopen", side_effect=[too_big_response, *matched_responses]) as request:
+            routes = snap_runs_osrm([points], SnapOptions())
+
+        self.assertEqual(routes, [[(40.0, -73.0), (40.0, -72.999), (40.0, -72.998)]])
+        self.assertEqual(request.call_count, 3)
+
+    def test_osrm_strategy_continues_after_failed_request(self):
+        failed_response = HTTPError(
+            "https://router.project-osrm.org/match",
+            400,
+            "Bad Request",
+            hdrs=None,
+            fp=BytesIO(b'{"code":"NoMatch","message":"No matchings found"}'),
+        )
+        successful_response = BytesIO(
+            json.dumps(
+                {
+                    "code": "Ok",
+                    "matchings": [
+                        {"geometry": {"type": "LineString", "coordinates": [[-72.99, 40.0], [-72.98, 40.0]]}}
+                    ],
+                }
+            ).encode("utf-8")
+        )
+        points = [TrackPoint(40.0, -73.0 + index * 0.0001) for index in range(51)]
+
+        with patch(
+            "snap_strategies.osrm.urlopen", side_effect=[failed_response, successful_response]
+        ) as request, self.assertLogs("snap_strategies.osrm", level="ERROR") as logs:
+            routes = snap_runs_osrm([points], SnapOptions())
+
+        self.assertEqual(routes, [[(40.0, -72.99), (40.0, -72.98)]])
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("OSRM Match failed for 50-point chunk; continuing", logs.output[0])
+
     def test_finds_json_files_recursively(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory) / "history"
@@ -296,11 +422,25 @@ class LocationHistoryRoutesTests(unittest.TestCase):
             source.write_text(json.dumps(data), encoding="utf-8")
             with patch(
                 "sys.argv",
-                ["location_history_to_kml.py", str(source), str(output), "--car", "--snap", "-S", "local"],
+                [
+                    "location_history_to_kml.py",
+                    str(source),
+                    str(output),
+                    "--car",
+                    "--snap",
+                    "-S",
+                    "osrm",
+                    "--osrm-url",
+                    "http://localhost:5000",
+                    "--osrm-profile",
+                    "car",
+                ],
             ), patch("location_history_to_kml.snap_runs", return_value=[[(40.0, -73.0), (40.1, -73.1)]]) as snap:
                 self.assertEqual(main(), 0)
 
-        self.assertEqual(snap.call_args.args[1], "local")
+            self.assertEqual(snap.call_args.args[1], "osrm")
+            self.assertEqual(snap.call_args.args[2].osrm_url, "http://localhost:5000")
+            self.assertEqual(snap.call_args.args[2].osrm_profile, "car")
 
     def test_osm_tile_cache_persists_and_reuses_downloaded_map(self):
         class FakeMap:

@@ -36,6 +36,8 @@ class SnapOptions:
     osm_cache_dir: Path | None = None
     network_type: str = "drive"
     overpass_url: str | None = None
+    osrm_url: str = "https://router.project-osrm.org"
+    osrm_profile: str | None = None
 
 
 def _mappymatch_components() -> tuple[Any, Any, Any, Any, Any, Any]:

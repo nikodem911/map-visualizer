@@ -55,6 +55,14 @@ To match routes to local OpenStreetMap road data with Mappymatch, select the `ma
 python3 location_history_to_kml.py .tmp/timeline.json august-car-matched.kml --car --date 2024-08-01:2024-08-31 --snap -S mappymatch --name "August 2024 driving"
 ```
 
+To use OSRM's Match service, select `osrm`:
+
+```bash
+python3 location_history_to_kml.py .tmp/timeline.json august-car-osrm.kml --car --snap -S osrm --name "August 2024 driving"
+```
+
+This sends GPS coordinates and available timestamps to `https://router.project-osrm.org` and uses the returned matched road geometries. The public service is rate-limited and supports only profiles enabled by its operator. Use `--osrm-url` for another OSRM server and `--osrm-profile` to select a profile it provides; the defaults are `driving` for car and `cycling` for bike. Long runs are sent in overlapping batches of at most 50 points; if a server reports its trace limit was exceeded, the request is retried with smaller batches.
+
 ### Use a Local Overpass Docker Server
 
 To avoid relying on the public Overpass service, you can run a regional Overpass instance locally with the community [`wiktorn/overpass-api`](https://hub.docker.com/r/wiktorn/overpass-api) image. This example initializes a persistent server from a Geofabrik Poland extract, bound to localhost only. Change the extract URLs and volume name to a region that contains all the trips you intend to match.

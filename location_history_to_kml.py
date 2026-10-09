@@ -346,6 +346,15 @@ def main() -> int:
         help="Overpass API base URL for mappymatch, for example http://127.0.0.1:12345/api",
     )
     parser.add_argument(
+        "--osrm-url",
+        default="https://router.project-osrm.org",
+        help="OSRM server base URL for the osrm snapping strategy",
+    )
+    parser.add_argument(
+        "--osrm-profile",
+        help="OSRM routing profile override (defaults to driving for car and cycling for bike)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Show OSM tile cache hits and detailed snapping diagnostics",
@@ -376,6 +385,8 @@ def main() -> int:
                     osm_cache_dir=arguments.osm_cache_dir,
                     network_type="bike" if arguments.mode == "bike" else "drive",
                     overpass_url=arguments.overpass_url,
+                    osrm_url=arguments.osrm_url,
+                    osrm_profile=arguments.osrm_profile,
                 ),
             )
         else:
