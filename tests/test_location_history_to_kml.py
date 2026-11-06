@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from unittest.mock import patch
 
+from count_kml_coordinates import count_coordinates
 from route_geometry import TrackPoint
 from location_history_to_kml import (
     activity_runs_from_data,
@@ -26,6 +27,17 @@ from snap_strategies.osrm import snap_runs_osrm
 
 
 class LocationHistoryRoutesTests(unittest.TestCase):
+    def test_counts_coordinate_tuples_in_kml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            kml_path = Path(directory) / "routes.kml"
+            kml_path.write_text(
+                '<kml xmlns="http://www.opengis.net/kml/2.2"><coordinates>'
+                '1,2,0 3,4,0\n5,6,0</coordinates><coordinates> </coordinates></kml>',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(count_coordinates(kml_path), 3)
+
     def test_osrm_strategy_requests_match_geometry_and_converts_coordinates(self):
         response = BytesIO(
             json.dumps(
