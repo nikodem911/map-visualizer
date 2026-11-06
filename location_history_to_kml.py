@@ -289,7 +289,25 @@ def activity_runs_from_data(data: Any, mode: str, date_filter: tuple[str, str] |
     if current_run:
         runs.append(current_run)
     raw_runs = [run for run in runs if len(run) >= 2]
-    return raw_runs if raw_runs else semantic_activity_runs_from_data(data, mode, date_filter)
+    semantic_runs = semantic_activity_runs_from_data(data, mode, date_filter)
+    raw_intervals = [
+        (run[0].timestamp, run[-1].timestamp)
+        for run in raw_runs
+        if run[0].timestamp is not None and run[-1].timestamp is not None
+    ]
+    uncovered_semantic_runs = []
+    for run in semantic_runs:
+        run_start = run[0].timestamp
+        run_end = run[-1].timestamp
+        overlaps_raw_run = (
+            run_start is not None
+            and run_end is not None
+            and any(raw_start <= run_end and run_start <= raw_end for raw_start, raw_end in raw_intervals)
+        )
+        if not overlaps_raw_run:
+            uncovered_semantic_runs.append(run)
+
+    return sorted(raw_runs + uncovered_semantic_runs, key=lambda run: run[0].timestamp or datetime.max.replace(tzinfo=timezone.utc))
 
 
 def write_kml(

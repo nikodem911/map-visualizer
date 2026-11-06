@@ -301,6 +301,50 @@ class LocationHistoryRoutesTests(unittest.TestCase):
             [[(49.0, 19.0), (49.03, 19.03), (49.07, 19.07), (49.1, 19.1)]],
         )
 
+    def test_activity_runs_combine_raw_and_uncovered_semantic_trips(self):
+        data = {
+            "rawSignals": [
+                {
+                    "activityRecord": {
+                        "timestamp": "2025-08-01T10:00:00Z",
+                        "probableActivities": [{"type": "IN_VEHICLE", "confidence": 0.9}],
+                    }
+                },
+                {"position": {"timestamp": "2025-08-01T10:00:01Z", "LatLng": "geo:40.0,-73.0"}},
+                {"position": {"timestamp": "2025-08-01T10:00:02Z", "LatLng": "geo:40.001,-73.001"}},
+            ],
+            "semanticSegments": [
+                {
+                    "startTime": "2025-08-01T10:00:00Z",
+                    "endTime": "2025-08-01T10:05:00Z",
+                    "activity": {
+                        "start": {"latLng": "40.0°, -73.0°"},
+                        "end": {"latLng": "40.001°, -73.001°"},
+                        "topCandidate": {"type": "IN_PASSENGER_VEHICLE"},
+                    },
+                },
+                {
+                    "startTime": "2025-08-02T10:00:00Z",
+                    "endTime": "2025-08-02T10:05:00Z",
+                    "activity": {
+                        "start": {"latLng": "41.0°, -74.0°"},
+                        "end": {"latLng": "41.001°, -74.001°"},
+                        "topCandidate": {"type": "IN_PASSENGER_VEHICLE"},
+                    },
+                },
+            ],
+        }
+
+        runs = activity_runs_from_data(data, "car")
+
+        self.assertEqual(
+            [[(point.latitude, point.longitude) for point in run] for run in runs],
+            [
+                [(40.0, -73.0), (40.001, -73.001)],
+                [(41.0, -74.0), (41.001, -74.001)],
+            ],
+        )
+
     def test_semantic_route_drops_impossible_activity_endpoint(self):
         data = {
             "semanticSegments": [
