@@ -8,8 +8,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import urlopen
 
 from route_geometry import TrackPoint, distance_meters
-from snap_strategies.common import Route
-from snap_strategies.mappymatch import SnapOptions
+from snap_strategies.common import Route, SnapOptions
 
 
 OSRM_MATCH_MAX_POINTS = 50

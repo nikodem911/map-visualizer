@@ -10,10 +10,6 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from unittest.mock import patch
 
-import osmnx as ox
-from pyproj import CRS, Transformer
-from shapely.geometry import LineString
-
 from route_geometry import TrackPoint
 from location_history_to_kml import (
     activity_runs_from_data,
@@ -23,8 +19,8 @@ from location_history_to_kml import (
     write_kml,
 )
 from snap_strategies import snap_runs
+from snap_strategies.common import SnapOptions
 from snap_strategies.local import snap_chunk
-from snap_strategies.mappymatch import OSMTileCache, SnapOptions
 from snap_strategies.osrm import snap_runs_osrm
 
 
@@ -445,152 +441,9 @@ class LocationHistoryRoutesTests(unittest.TestCase):
             self.assertEqual(snap.call_args.args[2].osrm_profile, "car")
             self.assertEqual(snap.call_args.args[3], "blue")
 
-    def test_osm_tile_cache_persists_and_reuses_downloaded_map(self):
-        class FakeMap:
-            downloads = 0
-            loads = 0
-
-            def __init__(self):
-                self.g = object()
-
-            @classmethod
-            def from_geofence(cls, *_args, **_kwargs):
-                cls.downloads += 1
-                return cls()
-
-            @classmethod
-            def from_file(cls, _path):
-                cls.loads += 1
-                return cls()
-
-            def to_file(self, path):
-                Path(path).write_bytes(b"cached OSM graph")
-
-        class FakeGeofence:
-            def __init__(self, **_kwargs):
-                pass
-
-        class FakeNetworkType:
-            DRIVE = SimpleNamespace(value="drive")
-            BIKE = SimpleNamespace(value="bike")
-
-        with tempfile.TemporaryDirectory() as directory:
-            cache = OSMTileCache(Path(directory))
-            cache.get_tile_map((98, 38), FakeMap, FakeGeofence, FakeNetworkType.DRIVE)
-            disk_cache = OSMTileCache(Path(directory))
-            disk_cache.get_tile_map((98, 38), FakeMap, FakeGeofence, FakeNetworkType.DRIVE)
-
-        self.assertEqual(FakeMap.downloads, 1)
-        self.assertEqual(FakeMap.loads, 1)
-        self.assertEqual(cache.fetch_attempts, 1)
-        self.assertEqual(disk_cache.disk_cache_hits, 1)
-
-    def test_osm_tile_fetch_error_includes_attempt_number_and_cause(self):
-        class FakeNetworkType:
-            DRIVE = SimpleNamespace(value="drive")
-
-        class FakeGeofence:
-            def __init__(self, **_kwargs):
-                pass
-
-        class FakeMap:
-            @classmethod
-            def from_geofence(cls, *_args, **_kwargs):
-                raise ConnectionError("connection refused")
-
-        with tempfile.TemporaryDirectory() as directory:
-            cache = OSMTileCache(Path(directory))
-            with self.assertLogs("snap_strategies.mappymatch", level="ERROR") as log_output:
-                with self.assertRaisesRegex(
-                    ValueError,
-                    r"OSM tile fetch #1 failed.*ConnectionError: connection refused",
-                ):
-                    cache.get_tile_map((99, 38), FakeMap, FakeGeofence, FakeNetworkType.DRIVE)
-
-        self.assertEqual(cache.fetch_attempts, 1)
-        self.assertEqual(cache.fetch_failures, 1)
-        self.assertTrue(any("OSM tile fetch #1 failed" in message for message in log_output.output))
-
-    def test_mappymatch_strategy_reuses_map_and_returns_road_geometry(self):
-        class FakeNetworkType:
-            DRIVE = SimpleNamespace(value="drive")
-            BIKE = SimpleNamespace(value="bike")
-
-        class FakeGeofence:
-            def __init__(self, **_kwargs):
-                pass
-
-        class FakeMap:
-            downloads = 0
-            requested_networks = []
-            requested_endpoints = []
-
-            def __init__(self, graph=None):
-                self.g = graph or object()
-                self.crs = CRS.from_epsg(3857)
-
-            @classmethod
-            def from_geofence(cls, _geofence, **kwargs):
-                cls.downloads += 1
-                cls.requested_networks.append(kwargs["network_type"].value)
-                cls.requested_endpoints.append(ox.settings.overpass_url)
-                return cls()
-
-            @classmethod
-            def from_file(cls, _path):
-                return cls()
-
-            def to_file(self, path):
-                Path(path).write_bytes(b"cached OSM graph")
-
-        class FakeTrace:
-            @classmethod
-            def from_dataframe(cls, frame, xy=True):
-                return frame
-
-        class FakeMatcher:
-            calls = 0
-
-            def __init__(self, _road_map, **_kwargs):
-                pass
-
-            def match_trace(self, _trace):
-                type(self).calls += 1
-                project = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
-                road = LineString([project(19.0, 49.0), project(19.01, 49.0)])
-                return SimpleNamespace(path=[SimpleNamespace(geom=road)], matches=[])
-
-        fake_networkx = SimpleNamespace(compose_all=lambda graphs: graphs[0])
-        start = datetime(2024, 8, 1, tzinfo=timezone.utc)
-        run = [
-            TrackPoint(49.0, 19.0, start),
-            TrackPoint(49.0, 19.005, start + timedelta(minutes=1)),
-            TrackPoint(49.0, 19.01, start + timedelta(minutes=2)),
-        ]
-        original_overpass_url = ox.settings.overpass_url
-
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "snap_strategies.mappymatch._mappymatch_components",
-            return_value=(FakeGeofence, FakeTrace, FakeMap, FakeNetworkType, FakeMatcher, fake_networkx),
-        ), patch.object(ox.settings, "overpass_url", ox.settings.overpass_url):
-            routes = snap_runs(
-                [run, run],
-                "mappymatch",
-                SnapOptions(
-                    Path(directory),
-                    network_type="bike",
-                    overpass_url="http://127.0.0.1:12345/api/",
-                ),
-            )
-            self.assertEqual(ox.settings.overpass_url, original_overpass_url)
-
-        self.assertEqual(FakeMap.downloads, 1)
-        self.assertEqual(FakeMap.requested_networks, ["bike"])
-        self.assertEqual(FakeMap.requested_endpoints, ["http://127.0.0.1:12345/api"])
-        self.assertEqual(FakeMatcher.calls, 2)
-        self.assertEqual(len(routes), 1)
-        self.assertTrue(math.isclose(routes[0][0][0], 49.0, abs_tol=1e-6))
-        self.assertTrue(math.isclose(routes[0][-1][1], 19.01, abs_tol=1e-6))
+    def test_removed_mappymatch_strategy_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown snap strategy 'mappymatch'"):
+            snap_runs([[TrackPoint(40.0, -73.0)]], "mappymatch")
 
     def test_without_snap_writes_recorded_points_without_an_api_key(self):
         data = {

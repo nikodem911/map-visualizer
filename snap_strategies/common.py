@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 from route_geometry import (
     ACTIVITY_ENDPOINT_TOLERANCE_METERS,
@@ -18,6 +19,13 @@ ROAD_DEDUP_MIN_COVERAGE = 0.7
 ROAD_DEDUP_MIN_DIRECTION_DOT = math.cos(math.radians(35))
 
 Route = list[tuple[float, float]]
+
+
+@dataclass(frozen=True)
+class SnapOptions:
+    network_type: str = "drive"
+    osrm_url: str = "https://router.project-osrm.org"
+    osrm_profile: str | None = None
 
 
 def route_edge_samples(

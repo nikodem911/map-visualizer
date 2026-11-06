@@ -358,16 +358,6 @@ def main() -> int:
         help="Snapping strategy to use with --snap (default: local)",
     )
     parser.add_argument(
-        "--osm-cache-dir",
-        type=Path,
-        default=Path.home() / ".cache" / "map-visualizer" / "osm",
-        help="Persistent cache directory for the mappymatch OSM road tiles",
-    )
-    parser.add_argument(
-        "--overpass-url",
-        help="Overpass API base URL for mappymatch, for example http://127.0.0.1:12345/api",
-    )
-    parser.add_argument(
         "--osrm-url",
         default="https://router.project-osrm.org",
         help="OSRM server base URL for the osrm snapping strategy",
@@ -404,9 +394,7 @@ def main() -> int:
                 runs,
                 arguments.snap_strategy,
                 SnapOptions(
-                    osm_cache_dir=arguments.osm_cache_dir,
                     network_type="bike" if arguments.mode == "bike" else "drive",
-                    overpass_url=arguments.overpass_url,
                     osrm_url=arguments.osrm_url,
                     osrm_profile=arguments.osrm_profile,
                 ),
