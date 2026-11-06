@@ -24,6 +24,16 @@ from snap_strategies import SNAP_STRATEGIES, SnapOptions, snap_runs
 
 
 KML_NAMESPACE = "http://www.opengis.net/kml/2.2"
+ROUTE_COLORS = {
+    "orange": "ff2878c8",
+    "blue": "ffff7b00",
+    "green": "ff00a500",
+    "red": "ff0000e6",
+    "purple": "ffcc3399",
+    "yellow": "ff00ffff",
+    "white": "ffffffff",
+    "black": "ff000000",
+}
 ACTIVITY_TYPES = {
     "car": {"IN_ROAD_VEHICLE", "IN_VEHICLE", "IN_PASSENGER_VEHICLE"},
     "bike": {"ON_BICYCLE", "CYCLING"},
@@ -282,14 +292,19 @@ def activity_runs_from_data(data: Any, mode: str, date_filter: tuple[str, str] |
     return raw_runs if raw_runs else semantic_activity_runs_from_data(data, mode, date_filter)
 
 
-def write_kml(routes: Iterable[list[tuple[float, float]]], output_path: Path, track_name: str) -> int:
+def write_kml(
+    routes: Iterable[list[tuple[float, float]]],
+    output_path: Path,
+    track_name: str,
+    color: str = "orange",
+) -> int:
     namespace = KML_NAMESPACE
     root = ET.Element(f"{{{namespace}}}kml")
     document = ET.SubElement(root, f"{{{namespace}}}Document")
     ET.SubElement(document, f"{{{namespace}}}name").text = track_name
     style = ET.SubElement(document, f"{{{namespace}}}Style", {"id": "route"})
     line_style = ET.SubElement(style, f"{{{namespace}}}LineStyle")
-    ET.SubElement(line_style, f"{{{namespace}}}color").text = "ff2878c8"
+    ET.SubElement(line_style, f"{{{namespace}}}color").text = ROUTE_COLORS[color]
     ET.SubElement(line_style, f"{{{namespace}}}width").text = "4"
 
     count = 0
@@ -319,6 +334,13 @@ def main() -> int:
     parser.add_argument("input", nargs="+", type=Path, help="JSON file(s) or folder(s) containing JSON")
     parser.add_argument("output", type=Path, help="Output KML file for Google My Maps")
     parser.add_argument("--name", default="Location History", help="Name for the map layer")
+    parser.add_argument(
+        "-C",
+        "--color",
+        choices=sorted(ROUTE_COLORS),
+        default="orange",
+        help="Route line color (default: orange)",
+    )
     parser.add_argument(
         "-d",
         "--date",
@@ -394,7 +416,7 @@ def main() -> int:
                 [(point.latitude, point.longitude) for point in run]
                 for run in runs
             ]
-        count = write_kml(routes, arguments.output, arguments.name)
+        count = write_kml(routes, arguments.output, arguments.name, arguments.color)
     except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

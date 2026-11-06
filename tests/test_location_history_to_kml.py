@@ -427,6 +427,8 @@ class LocationHistoryRoutesTests(unittest.TestCase):
                     str(source),
                     str(output),
                     "--car",
+                    "-C",
+                    "blue",
                     "--snap",
                     "-S",
                     "osrm",
@@ -441,6 +443,7 @@ class LocationHistoryRoutesTests(unittest.TestCase):
             self.assertEqual(snap.call_args.args[1], "osrm")
             self.assertEqual(snap.call_args.args[2].osrm_url, "http://localhost:5000")
             self.assertEqual(snap.call_args.args[2].osrm_profile, "car")
+            self.assertEqual(snap.call_args.args[3], "blue")
 
     def test_osm_tile_cache_persists_and_reuses_downloaded_map(self):
         class FakeMap:
@@ -624,9 +627,21 @@ class LocationHistoryRoutesTests(unittest.TestCase):
             root = ET.parse(output).getroot()
             namespace = "http://www.opengis.net/kml/2.2"
             coordinates = root.find(f".//{{{namespace}}}coordinates")
+            color = root.find(f".//{{{namespace}}}LineStyle/{{{namespace}}}color")
             self.assertEqual(count, 2)
             self.assertEqual(coordinates.text, "-73.000000,40.000000,0 -73.100000,40.100000,0")
+            self.assertEqual(color.text, "ff2878c8")
             self.assertIn(b'<kml xmlns="http://www.opengis.net/kml/2.2"', output.read_bytes())
+
+    def test_writes_selected_kml_route_color(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "blue-route.kml"
+            write_kml([[(40.0, -73.0), (40.1, -73.1)]], output, "Blue route", color="blue")
+
+            root = ET.parse(output).getroot()
+            namespace = "http://www.opengis.net/kml/2.2"
+            color = root.find(f".//{{{namespace}}}LineStyle/{{{namespace}}}color")
+            self.assertEqual(color.text, "ffff7b00")
 
 
 if __name__ == "__main__":

@@ -32,6 +32,12 @@ python3 location_history_to_kml.py .tmp/timeline_august_2026.json august-car.kml
 python3 location_history_to_kml.py .tmp/timeline_august_2026.json august-bike.kml --bike --name "August 2026 cycling"
 ```
 
+Set the route line color with `-C/--color`. Available colors are `orange` (default), `blue`, `green`, `red`, `purple`, `yellow`, `white`, and `black`:
+
+```bash
+python3 location_history_to_kml.py .tmp/timeline_august_2026.json august-car-blue.kml --car --color blue --name "August 2026 driving"
+```
+
 You can limit the export to a specific day or a date range with `-d/--date`:
 
 ```bash
