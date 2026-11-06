@@ -3,7 +3,8 @@ import math
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
-from io import BytesIO
+from contextlib import redirect_stdout
+from io import BytesIO, StringIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from location_history_to_kml import (
     write_kml,
 )
 from snap_strategies import snap_runs
-from snap_strategies.common import SnapOptions
+from snap_strategies.common import SnapOptions, SnapStats
 from snap_strategies.local import snap_chunk
 from snap_strategies.osrm import snap_runs_osrm
 
@@ -33,6 +34,7 @@ class LocationHistoryRoutesTests(unittest.TestCase):
                     "matchings": [
                         {"geometry": {"type": "LineString", "coordinates": [[-73.0, 40.0], [-72.9, 40.1]]}}
                     ],
+                    "tracepoints": [{}, None],
                 }
             ).encode("utf-8")
         )
@@ -42,9 +44,11 @@ class LocationHistoryRoutesTests(unittest.TestCase):
         ]
 
         with patch("snap_strategies.osrm.urlopen", return_value=response) as request:
-            routes = snap_runs_osrm([points], SnapOptions())
+            stats = SnapStats()
+            routes = snap_runs_osrm([points], SnapOptions(), stats)
 
         self.assertEqual(routes, [[(40.0, -73.0), (40.1, -72.9)]])
+        self.assertEqual((stats.attempted, stats.succeeded, stats.failed), (2, 1, 1))
         request_url = request.call_args.args[0]
         self.assertIn("/match/v1/driving/-73.000000,40.000000;-72.900000,40.100000", request_url)
         self.assertIn("geometries=geojson", request_url)
@@ -142,11 +146,13 @@ class LocationHistoryRoutesTests(unittest.TestCase):
         with patch(
             "snap_strategies.osrm.urlopen", side_effect=[failed_response, successful_response]
         ) as request, self.assertLogs("snap_strategies.osrm", level="ERROR") as logs:
-            routes = snap_runs_osrm([points], SnapOptions())
+            stats = SnapStats()
+            routes = snap_runs_osrm([points], SnapOptions(), stats)
 
         self.assertEqual(routes, [[(40.0, -72.99), (40.0, -72.98)]])
         self.assertEqual(request.call_count, 2)
-        self.assertIn("OSRM Match failed for 50-point chunk; continuing", logs.output[0])
+        self.assertIn("OSRM Match failed for 50-point request; continuing", logs.output[0])
+        self.assertEqual((stats.attempted, stats.succeeded, stats.failed), (52, 2, 50))
 
     def test_finds_json_files_recursively(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -434,12 +440,21 @@ class LocationHistoryRoutesTests(unittest.TestCase):
                     "car",
                 ],
             ), patch("location_history_to_kml.snap_runs", return_value=[[(40.0, -73.0), (40.1, -73.1)]]) as snap:
-                self.assertEqual(main(), 0)
+                stdout = StringIO()
+                with redirect_stdout(stdout):
+                    self.assertEqual(main(), 0)
 
             self.assertEqual(snap.call_args.args[1], "osrm")
             self.assertEqual(snap.call_args.args[2].osrm_url, "http://localhost:5000")
             self.assertEqual(snap.call_args.args[2].osrm_profile, "car")
-            self.assertEqual(snap.call_args.args[3], "blue")
+            self.assertIsInstance(snap.call_args.kwargs["stats"], SnapStats)
+            self.assertIn(
+                "Resolution point attempts: 0 (0/0, success rate: 0.0%)",
+                stdout.getvalue(),
+            )
+            namespace = "http://www.opengis.net/kml/2.2"
+            color = ET.parse(output).find(f".//{{{namespace}}}LineStyle/{{{namespace}}}color")
+            self.assertEqual(color.text, "ffff7b00")
 
     def test_removed_mappymatch_strategy_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unknown snap strategy 'mappymatch'"):

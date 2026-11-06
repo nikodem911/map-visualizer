@@ -5,6 +5,7 @@ import math
 from route_geometry import TrackPoint
 from snap_strategies.common import (
     Route,
+    SnapStats,
     deduplicate_route_edges,
     index_route_edges,
     merge_route_with_indexed_samples,
@@ -50,7 +51,12 @@ def snap_chunk(points: list[TrackPoint]) -> Route:
     return snapped
 
 
-def snap_runs_local(runs: list[list[TrackPoint]]) -> list[Route]:
+def snap_runs_local(runs: list[list[TrackPoint]], stats: SnapStats | None = None) -> list[Route]:
+    if stats is not None:
+        point_count = sum(len(run) for run in runs)
+        stats.attempted += point_count
+        stats.succeeded += point_count
+
     snapped_runs: list[Route] = []
     seen_road_samples: dict[tuple[int, int], list[tuple[float, float, float, float, float, float]]] = {}
     for run in runs:

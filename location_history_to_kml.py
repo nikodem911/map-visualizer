@@ -20,7 +20,7 @@ from route_geometry import (
     TrackPoint,
     distance_meters,
 )
-from snap_strategies import SNAP_STRATEGIES, SnapOptions, snap_runs
+from snap_strategies import SNAP_STRATEGIES, SnapOptions, SnapStats, snap_runs
 
 
 KML_NAMESPACE = "http://www.opengis.net/kml/2.2"
@@ -389,6 +389,7 @@ def main() -> int:
         if not runs:
             label = f"for {date_filter[0]} to {date_filter[1]}" if date_filter else ""
             raise ValueError(f"No {arguments.mode} activity samples with usable GPS positions were found {label}".strip())
+        snap_stats = SnapStats()
         if arguments.snap:
             routes = snap_runs(
                 runs,
@@ -398,6 +399,7 @@ def main() -> int:
                     osrm_url=arguments.osrm_url,
                     osrm_profile=arguments.osrm_profile,
                 ),
+                stats=snap_stats,
             )
         else:
             routes = [
@@ -410,6 +412,11 @@ def main() -> int:
         return 1
 
     print(f"Wrote {count} KML coordinates to {arguments.output}")
+    success_rate = snap_stats.succeeded / snap_stats.attempted * 100 if snap_stats.attempted else 0.0
+    print(
+        f"Resolution point attempts: {snap_stats.attempted} "
+        f"({snap_stats.succeeded}/{snap_stats.failed}, success rate: {success_rate:.1f}%)"
+    )
     return 0
 
 

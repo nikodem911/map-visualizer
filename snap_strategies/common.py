@@ -21,6 +21,13 @@ ROAD_DEDUP_MIN_DIRECTION_DOT = math.cos(math.radians(35))
 Route = list[tuple[float, float]]
 
 
+@dataclass
+class SnapStats:
+    attempted: int = 0
+    succeeded: int = 0
+    failed: int = 0
+
+
 @dataclass(frozen=True)
 class SnapOptions:
     network_type: str = "drive"

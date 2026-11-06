@@ -8,7 +8,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import urlopen
 
 from route_geometry import TrackPoint, distance_meters
-from snap_strategies.common import Route, SnapOptions
+from snap_strategies.common import Route, SnapOptions, SnapStats
 
 
 OSRM_MATCH_MAX_POINTS = 50
@@ -41,7 +41,9 @@ def _timestamp_seconds(points: list[TrackPoint]) -> list[int] | None:
     return timestamps
 
 
-def _match_chunk(points: list[TrackPoint], options: SnapOptions, profile: str) -> list[Route]:
+def _match_chunk(
+    points: list[TrackPoint], options: SnapOptions, profile: str
+) -> tuple[list[Route], int]:
     coordinates = ";".join(f"{point.longitude:.6f},{point.latitude:.6f}" for point in points)
     endpoint = f"{options.osrm_url.rstrip('/')}/match/v1/{quote(profile, safe='')}/{coordinates}"
     query: dict[str, str] = {"geometries": "geojson", "overview": OSRM_MATCH_OVERVIEW, "steps": "false"}
@@ -72,6 +74,12 @@ def _match_chunk(points: list[TrackPoint], options: SnapOptions, profile: str) -
         message = result.get("message") or result.get("code") or "unknown response"
         raise ValueError(f"OSRM Match request failed: {message}")
 
+    tracepoints = result.get("tracepoints")
+    succeeded = (
+        sum(tracepoint is not None for tracepoint in tracepoints)
+        if isinstance(tracepoints, list) and len(tracepoints) == len(points)
+        else len(points)
+    )
     routes: list[Route] = []
     for matching in result.get("matchings", []):
         geometry = matching.get("geometry", {})
@@ -80,7 +88,7 @@ def _match_chunk(points: list[TrackPoint], options: SnapOptions, profile: str) -
         route = [(float(latitude), float(longitude)) for longitude, latitude in geometry.get("coordinates", [])]
         if len(route) >= 2:
             routes.append(route)
-    return routes
+    return routes, succeeded
 
 
 def _chunks(points: list[TrackPoint]) -> list[list[TrackPoint]]:
@@ -95,16 +103,26 @@ def _chunks(points: list[TrackPoint]) -> list[list[TrackPoint]]:
     return chunks
 
 
-def _match_chunk_with_retry(points: list[TrackPoint], options: SnapOptions, profile: str) -> list[Route]:
+def _match_chunk_with_retry(
+    points: list[TrackPoint], options: SnapOptions, profile: str, stats: SnapStats | None = None
+) -> list[Route]:
     try:
-        return _match_chunk(points, options, profile)
+        routes, succeeded = _match_chunk(points, options, profile)
+        if stats is not None:
+            stats.attempted += len(points)
+            stats.succeeded += succeeded
+            stats.failed += len(points) - succeeded
+        return routes
     except _OSRMTooBigError as error:
         if len(points) <= 2:
+            if stats is not None:
+                stats.attempted += len(points)
+                stats.failed += len(points)
             raise ValueError(f"OSRM rejected a two-coordinate Match request: {error}") from error
 
         midpoint = len(points) // 2
-        first_routes = _match_chunk_with_retry(points[: midpoint + 1], options, profile)
-        second_routes = _match_chunk_with_retry(points[midpoint:], options, profile)
+        first_routes = _match_chunk_with_retry(points[: midpoint + 1], options, profile, stats)
+        second_routes = _match_chunk_with_retry(points[midpoint:], options, profile, stats)
         if first_routes and second_routes:
             first_end = TrackPoint(*first_routes[-1][-1])
             second_start = TrackPoint(*second_routes[0][0])
@@ -112,18 +130,23 @@ def _match_chunk_with_retry(points: list[TrackPoint], options: SnapOptions, prof
                 first_routes[-1].extend(second_routes.pop(0)[1:])
         return first_routes + second_routes
     except ValueError as error:
+        if stats is not None:
+            stats.attempted += len(points)
+            stats.failed += len(points)
         logger.error("OSRM Match failed for %d-point request; continuing: %s", len(points), error)
         return []
 
 
-def snap_runs_osrm(runs: list[list[TrackPoint]], options: SnapOptions) -> list[Route]:
+def snap_runs_osrm(
+    runs: list[list[TrackPoint]], options: SnapOptions, stats: SnapStats | None = None
+) -> list[Route]:
     profile = _profile_for_options(options)
     snapped_runs: list[Route] = []
     for run in runs:
         previous_chunk_had_routes = False
         for chunk in _chunks(run):
             try:
-                chunk_routes = _match_chunk_with_retry(chunk, options, profile)
+                chunk_routes = _match_chunk_with_retry(chunk, options, profile, stats)
             except ValueError as error:
                 logger.error("OSRM Match failed for %d-point chunk; continuing: %s", len(chunk), error)
                 previous_chunk_had_routes = False
